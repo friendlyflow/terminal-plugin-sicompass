@@ -159,7 +159,7 @@ impl InteractiveDetector {
                         self.cur = 0;
                         self.has_digit = false;
                     }
-                    b if matches!(b, 0x40..=0x7E) => {
+                    0x40..=0x7E => {
                         // Any other final byte — done with this sequence.
                         self.state = State::Ground;
                     }

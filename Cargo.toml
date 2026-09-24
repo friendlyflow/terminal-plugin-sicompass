@@ -1,17 +1,48 @@
+# Its own workspace root: a plugin, only ever built for wasm32-wasip2 (and
+# natively for its unit tests).
+[workspace]
+
 [package]
-publish = false  # internal crate, never published to crates.io
-name = "sicompass-terminal"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "Sicompass terminal provider (Rust)"
+name = "terminal-plugin"
+version = "0.2.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Terminal for sicompass: a shell as a list, with full-screen programs in a dashboard, as a WASM plugin"
+repository = "https://github.com/friendlyflow/terminal_plugin_sicompass"
+# A plugin ships as a signed release the sicompass Store installs, never on crates.io.
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
 
 [dependencies]
-sicompass-sdk = { workspace = true }
-sicompass-shell = { workspace = true }
-vte = { workspace = true }
-# Natural sort for the directory-browse listing, matching the file browser.
-natord = { workspace = true }
+# The guest kit and the FFON model. By git until sicompass-sdk 0.9 and
+# sicompass-pdk 0.6 are on crates.io; the pdk uses the SDK from the same rev.
+sicompass-pdk = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", rev = "ee8da2906073c5f29e9f7004c9ba13c6645e0d15" }
+sicompass-sdk = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", rev = "ee8da2906073c5f29e9f7004c9ba13c6645e0d15", default-features = false }
+# The terminal emulator behind the interactive dashboard.
+vte = "0.15"
+# Natural sort for the folder listing, matching the file browser.
+natord = "1"
+
+# The shell natively, for the unit tests. Inside the sandbox the host runs it.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+portable-pty = "0.9"
 
 [dev-dependencies]
-tempfile = { workspace = true }
+tempfile = "3"
+
+[profile.release]
+# Guests ship as bytecode, and App Store builds interpret rather than JIT them, so
+# a small module matters more than aggressive inlining.
+opt-level = "s"
+lto = true
+strip = true
+
+# Working on the SDK and this plugin together: uncomment, and comment it out
+# again before committing. With it live, a green build proves nothing about what
+# the pinned rev resolves to.
+#
+# [patch."https://github.com/friendlyflow/sicompass-plugin-sdk"]
+# sicompass-pdk = { path = "../sicompass-plugin-sdk/sicompass-pdk" }
+# sicompass-sdk = { path = "../sicompass-plugin-sdk" }

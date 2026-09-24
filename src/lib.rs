@@ -26,40 +26,30 @@
 //!   `DashboardFrame` every frame. This is the path that makes `vim`, `less`,
 //!   `htop`, and `claude` usable.
 //!
-//! The actual shell process lives in the internal `sicompass-shell` crate.
+//! The shell itself is [`shell::Shell`]: inside the sandbox a program the
+//! host runs on a PTY (`process`, which `plugin.json` asks for), natively a
+//! portable-pty one for the tests.
 
 mod emulator;
+mod fsx;
 mod interactive_detect;
+mod localize;
+mod shell;
+mod sys;
 
 use std::path::{Path, PathBuf};
 
 use emulator::{Emulator, encode_dashboard_key};
 use interactive_detect::{InteractiveDetector, InteractiveEvent};
-use sicompass_sdk::localize;
-use sicompass_sdk::{
-    BuiltinManifest, DashboardFrame, DashboardKey, DashboardKind, DashboardRequest, FfonElement,
-    Provider, SettingDecl, platform, register_builtin_manifest, register_provider_factory,
-};
-use sicompass_shell::{Shell, ShellConfig, default_program};
-use std::sync::OnceLock;
-
-/// Register this crate's translation bundles with the SDK localizer.
-/// Idempotent.
-pub fn register_translations() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let _ = localize::register_bundle("en-US", include_str!("../locales/en-US.ftl"));
-        let _ = localize::register_bundle("nl-BE", include_str!("../locales/nl-BE.ftl"));
-        let _ = localize::register_bundle("fr-BE", include_str!("../locales/fr-BE.ftl"));
-        let _ = localize::register_bundle("de-BE", include_str!("../locales/de-BE.ftl"));
-    });
-}
+use shell::{Shell, ShellConfig, default_program};
+use sicompass_pdk::{Descriptor, FfonElement, Frame, Key, Plugin, PollResult, export_plugin};
+use sicompass_sdk::{DashboardFrame, DashboardKey, DashboardRequest};
 
 // ---------------------------------------------------------------------------
 // Test stub: keep the ↑-recall command history purely in memory.
 //
-// `record_command` appends every submitted line to
-// `state_home()/sicompass/terminal/history`, so a test that drives a real shell
+// `record_command` appends every submitted line to the history file in the
+// plugin's storage folder, so a test that drives a real shell
 // writes into the developer's own recall history and it accumulates, run after
 // run. That is what filled it with `printf '\033[?1049h'; …`, bare `true`, and
 // `cd /tmp/…/elsewhere`.
@@ -157,12 +147,6 @@ pub struct TerminalProvider {
     /// belonged to the folder they had just moved to. Only the current attempt
     /// is worth reporting, so a new attempt replaces it and a success clears it.
     spawn_error: Option<String>,
-    /// User name for the synthesized prompt — captured once at construction
-    /// from `$USER`, falling back to `"user"`.
-    user: String,
-    /// Hostname for the synthesized prompt — captured once at construction,
-    /// truncated at the first `.`.
-    host: String,
 
     /// Lazily created on first `enter_dashboard()`. Lives across enter/leave
     /// so a long-running interactive session (e.g. `vim`) survives toggling
@@ -198,8 +182,8 @@ pub struct TerminalProvider {
     banner_pending: bool,
     /// `true` once `load_command_history()` has run for this provider.
     command_history_loaded: bool,
-    /// On-disk path for the recall history. `None` → resolved at use time
-    /// from `platform::state_home()`. Tests set this directly.
+    /// On-disk path for the recall history. `None` → the plugin's storage
+    /// folder. Tests set this directly.
     command_history_path: Option<PathBuf>,
     /// Counts appends since the last full file rewrite. We compact when this
     /// reaches `command_history_size`, bounding the file at ~2× the cap.
@@ -242,8 +226,6 @@ impl TerminalProvider {
             output_since_submit: true,
             init_attempted: false,
             spawn_error: None,
-            user: std::env::var("USER").unwrap_or_else(|_| "user".to_owned()),
-            host: hostname_short(),
             emulator: None,
             in_dashboard: false,
             dashboard_session_label: String::new(),
@@ -283,10 +265,8 @@ impl TerminalProvider {
                 n += 1;
             }
         });
-        for slot in events.iter().take(n) {
-            if let Some(e) = slot {
-                self.handle_interactive_event(*e);
-            }
+        for e in events.iter().take(n).flatten() {
+            self.handle_interactive_event(*e);
         }
     }
 
@@ -334,7 +314,9 @@ impl TerminalProvider {
         if test_no_history() {
             return None;
         }
-        sicompass_sdk::platform::app_state_dir().map(|s| s.join("terminal").join("history"))
+        // `permissions.storage`: the host's folder for this plugin.
+        cfg!(target_arch = "wasm32")
+            .then(|| PathBuf::from(sicompass_pdk::STORAGE_DIR).join("history"))
     }
 
     /// Read the recall-history file, keep the last `command_history_size`
@@ -376,7 +358,7 @@ impl TerminalProvider {
             return;
         };
         if let Some(parent) = path.parent() {
-            sicompass_sdk::platform::make_dirs(parent);
+            let _ = std::fs::create_dir_all(parent);
         }
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -419,19 +401,14 @@ impl TerminalProvider {
     /// "live input slot" check, which special-cases this provider by name and
     /// would otherwise mistake a `+i` directory for the shell's input line.
     fn list_subdirectories(&self) -> Vec<FfonElement> {
-        let Ok(read_dir) = std::fs::read_dir(&self.browse_path) else {
-            return Vec::new();
-        };
-        let mut names: Vec<String> = Vec::new();
-        for entry in read_dir.flatten() {
-            // `metadata()` follows symlinks, so a symlink pointing at a
-            // directory is offered as one — which is what `cd` would do too.
-            // Entries whose metadata can't be read (broken symlinks, races,
-            // permission holes) are skipped rather than shown as dead ends.
-            if entry.metadata().map(|m| m.is_dir()).unwrap_or(false) {
-                names.push(entry.file_name().to_string_lossy().into_owned());
-            }
-        }
+        // Symlinks are followed, so a symlink pointing at a directory is
+        // offered as one, which is what `cd` would do too. Entries that can't
+        // be read (broken symlinks, races, permission holes) are skipped
+        // rather than shown as dead ends.
+        let mut names: Vec<String> = fsx::list_dir(&self.browse_path)
+            .into_iter()
+            .filter(|name| fsx::is_dir(&self.browse_path.join(name)))
+            .collect();
         names.sort_by(|a, b| natord::compare_ignore_case(a, b));
         names
             .into_iter()
@@ -517,7 +494,7 @@ impl TerminalProvider {
         };
         for candidate in order {
             match candidate {
-                Some(p) if p.is_dir() => {
+                Some(p) if fsx::is_dir(&p) => {
                     self.shell_path = p.to_string_lossy().into_owned();
                     return;
                 }
@@ -545,7 +522,7 @@ impl TerminalProvider {
         self.sync_shell_path(!self.output_since_submit);
         self.view = View::Browse;
         let followed = PathBuf::from(&self.shell_path);
-        if followed.is_dir() {
+        if fsx::is_dir(&followed) {
             self.browse_path = followed;
         }
     }
@@ -596,11 +573,6 @@ impl TerminalProvider {
         let cfg = ShellConfig {
             program: self.shell_program.clone(),
             cwd: self.cwd.clone(),
-            // Make each tab's shell identifiable in process monitors (btop/ps,
-            // Task Manager) by launching it through a link renamed to this. Works
-            // for any shell (fish included); falls back to a normal spawn if the
-            // link can't be created.
-            title: Some("sicompass-shell".to_owned()),
             ..ShellConfig::default()
         };
         match Shell::spawn(cfg) {
@@ -634,39 +606,32 @@ impl TerminalProvider {
     /// those have proven unreliable across shells, locales, and rc-file edge
     /// cases (literal backslashes, missing prompt on first entry, ...).
     /// Synthesizing in-process gives us a stable, predictable prompt that
-    /// updates after `cd` on Linux (via `/proc/<pid>/cwd`); on macOS and
-    /// Windows the prompt reflects the *initial* cwd, since live tracking
-    /// would require platform-specific process-introspection APIs.
+    /// updates after `cd` where the host can see the shell's directory
+    /// (Linux); elsewhere the prompt follows the `cd`s it parses.
     fn current_prompt(&self) -> String {
         let cwd = self.shell_cwd();
-        if platform::is_windows() {
+        if sys::is_windows() {
             // cmd.exe / PowerShell convention: `C:\path>` with no user@host.
             format!("{}> ", cwd)
         } else {
             let display_cwd = collapse_home(&cwd);
-            format!("{}@{}:{}$ ", self.user, self.host, display_cwd)
+            format!("{}@{}:{}$ ", sys::user(), sys::host(), display_cwd)
         }
     }
 
-    /// Read the shell child's current working directory. Linux: `readlink
-    /// /proc/<pid>/cwd`. Other platforms (macOS, Windows) have no equivalent
-    /// cheap-and-portable read, so the prompt does not auto-update after
-    /// `cd` there — it falls back to the initial cwd (or `$HOME`/`/`).
+    /// The shell child's current working directory, where the system says
+    /// (Linux, through the host). Elsewhere the prompt does not auto-update
+    /// after a `cd` it could not parse: it falls back to the last parsed or
+    /// initial cwd (or home, or `/`).
     fn shell_cwd(&self) -> String {
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(pid) = self.shell.as_ref().and_then(|s| s.pid()) {
-                let link = format!("/proc/{}/cwd", pid);
-                if let Ok(p) = std::fs::read_link(&link) {
-                    return p.to_string_lossy().into_owned();
-                }
-            }
+        if let Some(live) = self.shell.as_ref().and_then(|s| s.cwd()) {
+            return live;
         }
         self.cwd
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
-            .or_else(|| platform::home_dir().map(|h| h.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| platform::path_separator().to_owned())
+            .or_else(|| sys::home_dir().map(|h| h.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| if sys::is_windows() { "\\" } else { "/" }.to_owned())
     }
 }
 
@@ -676,33 +641,23 @@ impl Default for TerminalProvider {
     }
 }
 
-impl Provider for TerminalProvider {
-    fn name(&self) -> &str {
+// ---------------------------------------------------------------------------
+// What the plugin trait does not have: the answers `poll` batches, and the
+// calls in the shape the tests drive them.
+// ---------------------------------------------------------------------------
+
+impl TerminalProvider {
+    pub fn name(&self) -> &str {
         "terminal"
     }
 
-    fn display_name(&self) -> String {
-        register_translations();
+    pub fn display_name(&self) -> String {
         localize::t("terminal-display-name")
     }
 
-    /// Start at the filesystem root in the browse view. The shell is *not*
-    /// spawned here — that happens on the first `:` (see `enter_shell`), so a
-    /// terminal tab the user only browses never costs a PTY.
-    fn init(&mut self) {
-        self.view = View::Browse;
-        self.browse_path = PathBuf::from("/");
-    }
-
-    fn cleanup(&mut self) {
-        self.spawn_error = None;
-        self.shell = None;
-        self.init_attempted = false;
-    }
-
-    /// OS process id of the child shell, if started. `None` until the shell has
-    /// been spawned (lazy `ensure_shell`), so the tab-switcher label falls back
-    /// gracefully.
+    /// OS process id of the child shell, if started (natively; inside the
+    /// sandbox the host reports it to the tab switcher itself).
+    #[cfg(test)]
     fn process_id(&self) -> Option<u32> {
         self.shell.as_ref().and_then(|s| s.pid())
     }
@@ -717,6 +672,177 @@ impl Provider for TerminalProvider {
                 .as_ref()
                 .map(|s| s.foreground_busy())
                 .unwrap_or(false)
+    }
+
+    fn at_root(&self) -> bool {
+        self.browse_path == Path::new("/")
+    }
+
+    fn handle_command(
+        &mut self,
+        command: &str,
+        _element_key: &str,
+        _element_type: i32,
+        _error: &mut String,
+    ) -> Option<FfonElement> {
+        match command {
+            CMD_SHELL => self.enter_shell(),
+            CMD_BROWSE => self.leave_shell(),
+            _ => {}
+        }
+        // No element to insert and no error: the app treats this as a state
+        // toggle and refreshes the current level, which is exactly the view swap.
+        None
+    }
+
+    fn tick(&mut self) -> bool {
+        let Some(shell) = self.shell.as_mut() else {
+            return false;
+        };
+        let bytes = shell.drain_output();
+        if bytes.is_empty() {
+            return false;
+        }
+        // Run the interactive detector on every chunk regardless of mode — it
+        // sees both the entering toggle (in scrollback) and the exiting toggle
+        // (during dashboard) so the app can auto-switch in either direction.
+        self.drive_interactive_detector(&bytes);
+        if self.in_dashboard {
+            // Route raw bytes through the ANSI/VT emulator. The next
+            // `dashboard_render` call will snapshot the updated grid.
+            if let Some(em) = self.emulator.as_mut() {
+                em.feed(&bytes);
+            }
+            return true;
+        }
+        let text = decode_terminal_output(&bytes);
+        if text.is_empty() {
+            return false;
+        }
+        // Drop pre-command output (shell startup banner, the shell's own PS1).
+        // We synthesize our own prompt from `{user}@{host}:{cwd}$ ` instead of
+        // capturing what the shell emits, so any PS1 bytes that arrive here
+        // are noise and can be discarded.
+        if let Some(last) = self.entries.last_mut() {
+            last.output.push_str(&text);
+        }
+        // Output means the shell has been running, so its live cwd is now both
+        // current and able to reflect a `cd` we never parsed.
+        self.output_since_submit = true;
+        self.sync_shell_path(false);
+        // While the user is browsing folders the scrollback is off screen.
+        // Returning `true` here would make the app re-`fetch()` — and therefore
+        // re-read from disk — the *directory listing* on every byte the shell
+        // produces. The output is still captured above, so nothing is lost.
+        self.view == View::Shell
+    }
+
+    fn take_dashboard_request(&mut self) -> Option<DashboardRequest> {
+        self.pending_dashboard_request.take()
+    }
+
+    fn dashboard_key(&mut self, key: DashboardKey) -> bool {
+        if let Some(bytes) = encode_dashboard_key(&key)
+            && let Some(shell) = self.shell.as_mut() {
+                let _ = shell.write_input(&bytes);
+            }
+        // Always request redraw — the shell may produce output before the
+        // next tick and we want the cursor blink to keep up.
+        true
+    }
+
+    fn dashboard_render(&mut self, cols: u16, rows: u16) -> DashboardFrame {
+        // Pull any bytes the shell has produced since the last `tick()`.
+        // Normally the main loop's `tick()` runs first, but draining here
+        // means a frame triggered by user input shows the response without
+        // waiting one extra frame.
+        let drained: Vec<u8> = self
+            .shell
+            .as_mut()
+            .map(|s| s.drain_output())
+            .unwrap_or_default();
+        if !drained.is_empty() {
+            // Detector first — Leave during dashboard render must be observed
+            // before the next `take_dashboard_request()` poll.
+            self.drive_interactive_detector(&drained);
+            if let Some(em) = self.emulator.as_mut() {
+                em.feed(&drained);
+            }
+        }
+        match self.emulator.as_ref() {
+            Some(em) => em.snapshot(),
+            None => DashboardFrame::empty(cols, rows),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plugin impl
+// ---------------------------------------------------------------------------
+
+impl Plugin for TerminalProvider {
+    fn new() -> Self {
+        TerminalProvider::new()
+    }
+
+    fn describe(&self) -> Descriptor {
+        Descriptor {
+            name: self.name().to_owned(),
+            display_name: self.display_name(),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            path_is_filesystem: true,
+            dashboard_kind: sicompass_pdk::DashboardKind::Interactive,
+            // Entry is always automatic — `interactive_detect` enters when a
+            // full-terminal program starts and leaves when it exits. A manual
+            // `d` at a bare shell prompt would have no clean exit path because
+            // every key — including Esc and Ctrl+C — is forwarded to the
+            // program.
+            manual_dashboard_entry_allowed: false,
+            ..Default::default()
+        }
+    }
+
+    /// Everything the app asks each frame: shell output, the dashboard
+    /// switch the detector asked for, and whether a command is running.
+    fn poll(&mut self) -> PollResult {
+        let redraw = self.tick();
+        PollResult {
+            redraw,
+            is_busy: self.is_busy(),
+            at_root: self.at_root(),
+            dashboard_request: self.take_dashboard_request().map(|r| match r {
+                DashboardRequest::Enter => sicompass_pdk::DashboardRequest::Enter,
+                DashboardRequest::Leave => sicompass_pdk::DashboardRequest::Leave,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Start at the filesystem root in the browse view. The shell is *not*
+    /// spawned here — that happens on the first `:` (see `enter_shell`), so a
+    /// terminal tab the user only browses never costs a PTY.
+    fn init(&mut self) {
+        self.view = View::Browse;
+        self.browse_path = PathBuf::from("/");
+        // The settings `plugin.json` declares, from the host. (The unit tests
+        // set them through `on_setting_change`.)
+        #[cfg(target_arch = "wasm32")]
+        for key in [
+            SETTING_SHELL,
+            "scrollbackSize",
+            "commandHistorySize",
+            "autoEnterDashboard",
+        ] {
+            if let Some(v) = sicompass_pdk::host::get_setting(key) {
+                self.on_setting_change(key, &v);
+            }
+        }
+    }
+
+    fn cleanup(&mut self) {
+        self.spawn_error = None;
+        self.shell = None;
+        self.init_attempted = false;
     }
 
     fn fetch(&mut self) -> Vec<FfonElement> {
@@ -766,14 +892,6 @@ impl Provider for TerminalProvider {
 
     fn set_current_path(&mut self, path: &str) {
         self.browse_path = PathBuf::from(path);
-    }
-
-    fn path_is_filesystem(&self) -> bool {
-        true
-    }
-
-    fn at_root(&self) -> bool {
-        self.browse_path == Path::new("/")
     }
 
     fn commit_edit(&mut self, old: &str, new: &str) -> bool {
@@ -859,7 +977,6 @@ impl Provider for TerminalProvider {
     }
 
     fn command_label(&self, cmd: &str) -> String {
-        register_translations();
         match cmd {
             CMD_SHELL => localize::t("terminal-command-shell"),
             CMD_BROWSE => localize::t("terminal-command-browse"),
@@ -870,66 +987,23 @@ impl Provider for TerminalProvider {
     fn handle_command(
         &mut self,
         command: &str,
-        _element_key: &str,
-        _element_type: i32,
-        _error: &mut String,
-    ) -> Option<FfonElement> {
-        match command {
-            CMD_SHELL => self.enter_shell(),
-            CMD_BROWSE => self.leave_shell(),
-            _ => {}
+        element_key: &str,
+        element_type: i32,
+    ) -> Result<Option<FfonElement>, String> {
+        let mut error = String::new();
+        let out =
+            TerminalProvider::handle_command(self, command, element_key, element_type, &mut error);
+        if error.is_empty() {
+            Ok(out)
+        } else {
+            Err(error)
         }
-        // No element to insert and no error: the app treats this as a state
-        // toggle and refreshes the current level, which is exactly the view swap.
-        None
-    }
-
-    fn tick(&mut self) -> bool {
-        let Some(shell) = self.shell.as_mut() else {
-            return false;
-        };
-        let bytes = shell.drain_output();
-        if bytes.is_empty() {
-            return false;
-        }
-        // Run the interactive detector on every chunk regardless of mode — it
-        // sees both the entering toggle (in scrollback) and the exiting toggle
-        // (during dashboard) so the app can auto-switch in either direction.
-        self.drive_interactive_detector(&bytes);
-        if self.in_dashboard {
-            // Route raw bytes through the ANSI/VT emulator. The next
-            // `dashboard_render` call will snapshot the updated grid.
-            if let Some(em) = self.emulator.as_mut() {
-                em.feed(&bytes);
-            }
-            return true;
-        }
-        let text = decode_terminal_output(&bytes);
-        if text.is_empty() {
-            return false;
-        }
-        // Drop pre-command output (shell startup banner, the shell's own PS1).
-        // We synthesize our own prompt from `{user}@{host}:{cwd}$ ` instead of
-        // capturing what the shell emits, so any PS1 bytes that arrive here
-        // are noise and can be discarded.
-        if let Some(last) = self.entries.last_mut() {
-            last.output.push_str(&text);
-        }
-        // Output means the shell has been running, so its live cwd is now both
-        // current and able to reflect a `cd` we never parsed.
-        self.output_since_submit = true;
-        self.sync_shell_path(false);
-        // While the user is browsing folders the scrollback is off screen.
-        // Returning `true` here would make the app re-`fetch()` — and therefore
-        // re-read from disk — the *directory listing* on every byte the shell
-        // produces. The output is still captured above, so nothing is lost.
-        self.view == View::Shell
     }
 
     fn on_setting_change(&mut self, key: &str, value: &str) {
         match key {
-            "shellProgram" if !value.is_empty() => {
-                self.shell_program = value.to_owned();
+            SETTING_SHELL => {
+                self.shell_program = program_name(value);
             }
             "scrollbackSize" => {
                 if let Ok(n) = value.parse::<usize>() {
@@ -951,18 +1025,6 @@ impl Provider for TerminalProvider {
     }
 
     // ---- Interactive dashboard (Phase 2b) -------------------------------
-
-    fn dashboard_kind(&self) -> DashboardKind {
-        DashboardKind::Interactive
-    }
-
-    fn manual_dashboard_entry_allowed(&self) -> bool {
-        // Entry is always automatic — `interactive_detect` enters when a
-        // full-terminal program starts and leaves when it exits. A manual `d`
-        // at a bare shell prompt would have no clean exit path because every
-        // key — including Esc and Ctrl+C — is forwarded to the program.
-        false
-    }
 
     fn enter_dashboard(&mut self) {
         self.ensure_shell();
@@ -1018,10 +1080,6 @@ impl Provider for TerminalProvider {
         }
     }
 
-    fn take_dashboard_request(&mut self) -> Option<DashboardRequest> {
-        self.pending_dashboard_request.take()
-    }
-
     fn dashboard_resize(&mut self, rows: u16, cols: u16) {
         if let Some(shell) = self.shell.as_mut() {
             let _ = shell.resize(rows, cols);
@@ -1031,15 +1089,8 @@ impl Provider for TerminalProvider {
         }
     }
 
-    fn dashboard_key(&mut self, key: DashboardKey) -> bool {
-        if let Some(bytes) = encode_dashboard_key(&key) {
-            if let Some(shell) = self.shell.as_mut() {
-                let _ = shell.write_input(&bytes);
-            }
-        }
-        // Always request redraw — the shell may produce output before the
-        // next tick and we want the cursor blink to keep up.
-        true
+    fn dashboard_key(&mut self, key: Key) -> bool {
+        TerminalProvider::dashboard_key(self, key.into())
     }
 
     fn dashboard_text(&mut self, text: &str) {
@@ -1070,30 +1121,36 @@ impl Provider for TerminalProvider {
         }
     }
 
-    fn dashboard_render(&mut self, cols: u16, rows: u16) -> DashboardFrame {
-        // Pull any bytes the shell has produced since the last `tick()`.
-        // Normally the main loop's `tick()` runs first, but draining here
-        // means a frame triggered by user input shows the response without
-        // waiting one extra frame.
-        let drained: Vec<u8> = self
-            .shell
-            .as_mut()
-            .map(|s| s.drain_output())
-            .unwrap_or_default();
-        if !drained.is_empty() {
-            // Detector first — Leave during dashboard render must be observed
-            // before the next `take_dashboard_request()` poll.
-            self.drive_interactive_detector(&drained);
-            if let Some(em) = self.emulator.as_mut() {
-                em.feed(&drained);
-            }
-        }
-        match self.emulator.as_ref() {
-            Some(em) => em.snapshot(),
-            None => DashboardFrame::empty(cols, rows),
-        }
+    fn dashboard_render(&mut self, cols: u16, rows: u16) -> Frame {
+        TerminalProvider::dashboard_render(self, cols, rows).into()
     }
 }
+
+/// The setting (declared in `plugin.json`) naming the shell.
+const SETTING_SHELL: &str = "shellProgram";
+
+/// The program to ask the host for, from the `shellProgram` setting.
+///
+/// The host starts only a name `plugin.json` lists, never a path. An empty
+/// value is the login shell. A path (which is what the setting held when the
+/// terminal came with the app) is taken by its file name, which `PATH`
+/// resolves to the same shell on any ordinary system.
+fn program_name(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return default_program();
+    }
+    if !cfg!(target_arch = "wasm32") || value == "$SHELL" {
+        return value.to_owned();
+    }
+    Path::new(value)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.strip_suffix(".exe").unwrap_or(n).to_owned())
+        .unwrap_or_else(default_program)
+}
+
+export_plugin!(TerminalProvider);
 
 /// Render an entry's output as a list of child lines, stripping the noise
 /// produced by the PTY around the actual command output:
@@ -1144,25 +1201,6 @@ fn build_paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     buf
 }
 
-/// Read the system hostname, truncate at the first `.` (so `host.example.com`
-/// renders as `host`), and fall back to `"host"` on failure.
-fn hostname_short() -> String {
-    let raw = std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout).ok()
-            } else {
-                None
-            }
-        })
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| std::env::var("HOSTNAME").unwrap_or_else(|_| "host".to_owned()));
-    raw.split('.').next().unwrap_or("host").to_owned()
-}
-
 /// Expand a leading `~` or `~/` to `$HOME`. Other input passes through verbatim.
 fn expand_home(value: &str) -> PathBuf {
     // Accept both `~` and `~/foo` and `~\foo` (the latter for Windows users
@@ -1176,15 +1214,14 @@ fn expand_home(value: &str) -> PathBuf {
     } else {
         None
     };
-    if let Some(rest) = rest {
-        if let Some(home) = platform::home_dir() {
+    if let Some(rest) = rest
+        && let Some(home) = sys::home_dir() {
             return if rest.is_empty() {
                 home
             } else {
                 home.join(rest)
             };
         }
-    }
     PathBuf::from(value)
 }
 
@@ -1221,7 +1258,7 @@ fn parse_cd(line: &str, base: &Path) -> Option<PathBuf> {
     };
 
     if rest.is_empty() {
-        return platform::home_dir();
+        return sys::home_dir();
     }
 
     let unquoted = strip_surrounding_quotes(rest);
@@ -1244,7 +1281,7 @@ fn parse_cd(line: &str, base: &Path) -> Option<PathBuf> {
 /// a quote is not creatable through Explorer anyway.
 fn quote_for_shell(p: &Path) -> String {
     let s = p.to_string_lossy();
-    if platform::is_windows() {
+    if sys::is_windows() {
         format!("\"{}\"", s.replace('"', ""))
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
@@ -1287,7 +1324,7 @@ fn logical_normalize(p: &Path) -> PathBuf {
 /// Uses `Path::strip_prefix` so the comparison works with both `/` and `\\`
 /// separators rather than relying on a hard-coded `/`.
 fn collapse_home(cwd: &str) -> String {
-    collapse_home_with(cwd, platform::home_dir().as_deref())
+    collapse_home_with(cwd, sys::home_dir().as_deref())
 }
 
 fn collapse_home_with(cwd: &str, home: Option<&Path>) -> String {
@@ -1319,7 +1356,7 @@ fn decode_terminal_output(bytes: &[u8]) -> String {
             '\x1b' => match chars.next() {
                 Some('[') => {
                     // CSI: parameters then a final byte in 0x40..=0x7E.
-                    while let Some(nc) = chars.next() {
+                    for nc in chars.by_ref() {
                         let n = nc as u32;
                         if (0x40..=0x7E).contains(&n) {
                             break;
@@ -1352,7 +1389,7 @@ fn decode_terminal_output(bytes: &[u8]) -> String {
             c if (c as u32) < 0x20 && c != '\n' && c != '\t' => {
                 // drop other C0 controls
             }
-            c if matches!(c as u32, 0x7F | 0x80..=0x9F) => {
+            c if matches!(c as u32, 0x7F..=0x9F) => {
                 // drop DEL + C1 control range (these sneak in via UTF-8 of
                 // 0xC2 0x80..0x9F or as raw bytes when bash emits 8-bit
                 // control codes).
@@ -1361,46 +1398,6 @@ fn decode_terminal_output(bytes: &[u8]) -> String {
         }
     }
     out
-}
-
-// ---------------------------------------------------------------------------
-// SDK registration
-// ---------------------------------------------------------------------------
-
-/// Register the terminal with the SDK factory and manifest registries.
-pub fn register() {
-    register_provider_factory("terminal", || Box::new(TerminalProvider::new()));
-    // No "initial path" setting: the folder the user browses to before pressing
-    // `:` is what the shell is spawned into, so a configured start directory
-    // would only contradict it.
-    register_builtin_manifest(
-        BuiltinManifest::new("terminal", "terminal").with_settings(vec![
-            SettingDecl::text(
-                "terminal",
-                "shell program",
-                "shellProgram",
-                &default_program(),
-            ),
-            SettingDecl::text(
-                "terminal",
-                "shell command history",
-                "commandHistorySize",
-                "50000",
-            ),
-            SettingDecl::text(
-                "terminal",
-                "terminal emulator scrollback",
-                "scrollbackSize",
-                "50000",
-            ),
-            SettingDecl::checkbox(
-                "terminal",
-                "auto-launch dashboard for interactive programs",
-                "autoEnterDashboard",
-                true,
-            ),
-        ]),
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1594,7 +1591,7 @@ mod tests {
         assert_eq!(p.view, View::Browse);
         assert_eq!(p.current_path(), "/");
         assert!(p.at_root());
-        assert!(p.path_is_filesystem());
+        assert!(p.describe().path_is_filesystem);
         // The whole point of lazy spawning: browsing costs no PTY.
         assert_eq!(p.process_id(), None);
         assert!(p.shell.is_none());
@@ -2472,7 +2469,7 @@ mod tests {
     fn parse_cd_no_argument_returns_home() {
         let got = parse_cd("cd", Path::new("/tmp"));
         // Skip if HOME/USERPROFILE not set in test env.
-        if let Some(home) = platform::home_dir() {
+        if let Some(home) = sys::home_dir() {
             assert_eq!(got, Some(home));
         }
     }
@@ -2506,7 +2503,10 @@ mod tests {
     #[test]
     fn dashboard_kind_is_interactive() {
         let p = TerminalProvider::new();
-        assert_eq!(p.dashboard_kind(), DashboardKind::Interactive);
+        assert!(matches!(
+            p.describe().dashboard_kind,
+            sicompass_pdk::DashboardKind::Interactive
+        ));
     }
 
     #[test]
@@ -2703,8 +2703,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut saw_output = false;
         while Instant::now() < deadline {
-            if p.tick() {
-                if p.entries
+            if p.tick()
+                && p.entries
                     .last()
                     .unwrap()
                     .output
@@ -2713,7 +2713,6 @@ mod tests {
                     saw_output = true;
                     break;
                 }
-            }
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
@@ -2732,7 +2731,7 @@ mod tests {
         assert!(
             elems[0]
                 .as_str()
-                .map_or(false, |s| s.ends_with("echo terminal-it-test")),
+                .is_some_and(|s| s.ends_with("echo terminal-it-test")),
             "first element should end with command; got {:?}",
             elems[0].as_str()
         );
@@ -2740,19 +2739,19 @@ mod tests {
             elems
                 .last()
                 .and_then(|e| e.as_obj())
-                .map_or(false, |o| o.key.ends_with("<input></input>")),
+                .is_some_and(|o| o.key.ends_with("<input></input>")),
             "last element should be the +i input slot; got {:?}",
             elems.last()
         );
         assert!(
             elems
                 .iter()
-                .any(|e| e.as_str().map_or(false, |s| s.contains("terminal-it-test")))
+                .any(|e| e.as_str().is_some_and(|s| s.contains("terminal-it-test")))
         );
         // The committed command landed in the recall history → slot children
         // are `<button>` Strs.
         assert!(
-            elems.last().and_then(|e| e.as_obj()).map_or(false, |o| o
+            elems.last().and_then(|e| e.as_obj()).is_some_and(|o| o
                 .children
                 .iter()
                 .any(|c| c.as_str()

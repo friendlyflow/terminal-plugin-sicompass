@@ -301,13 +301,13 @@ impl EmulatorState {
                 let src_start = (r + 1) * cols;
                 let dst_start = r * cols;
                 for c in 0..cols {
-                    s.cells[dst_start + c] = s.cells[src_start + c].clone();
+                    s.cells[dst_start + c] = s.cells[src_start + c];
                 }
             }
             // Blank the bottom row of the scroll region.
             let bot_start = bot * cols;
             for c in 0..cols {
-                s.cells[bot_start + c] = blank.clone();
+                s.cells[bot_start + c] = blank;
             }
         }
     }
@@ -327,13 +327,13 @@ impl EmulatorState {
                 let src_start = r * cols;
                 let dst_start = (r + 1) * cols;
                 for c in 0..cols {
-                    s.cells[dst_start + c] = s.cells[src_start + c].clone();
+                    s.cells[dst_start + c] = s.cells[src_start + c];
                 }
             }
             // Blank the top row of the scroll region.
             let top_start = top * cols;
             for c in 0..cols {
-                s.cells[top_start + c] = blank.clone();
+                s.cells[top_start + c] = blank;
             }
         }
     }
@@ -349,17 +349,17 @@ impl EmulatorState {
         match mode {
             0 => {
                 for c in (col as usize)..cols_usize {
-                    s.cells[row_start + c] = blank.clone();
+                    s.cells[row_start + c] = blank;
                 }
             }
             1 => {
                 for c in 0..=(col as usize).min(cols_usize.saturating_sub(1)) {
-                    s.cells[row_start + c] = blank.clone();
+                    s.cells[row_start + c] = blank;
                 }
             }
             2 => {
                 for c in 0..cols_usize {
-                    s.cells[row_start + c] = blank.clone();
+                    s.cells[row_start + c] = blank;
                 }
             }
             _ => {}
@@ -377,28 +377,28 @@ impl EmulatorState {
             0 => {
                 let row_start = row * cols;
                 for c in col..cols {
-                    s.cells[row_start + c] = blank.clone();
+                    s.cells[row_start + c] = blank;
                 }
                 for r in (row + 1)..rows {
                     for c in 0..cols {
-                        s.cells[r * cols + c] = blank.clone();
+                        s.cells[r * cols + c] = blank;
                     }
                 }
             }
             1 => {
                 for r in 0..row {
                     for c in 0..cols {
-                        s.cells[r * cols + c] = blank.clone();
+                        s.cells[r * cols + c] = blank;
                     }
                 }
                 let row_start = row * cols;
                 for c in 0..=col.min(cols.saturating_sub(1)) {
-                    s.cells[row_start + c] = blank.clone();
+                    s.cells[row_start + c] = blank;
                 }
             }
             2 | 3 => {
                 for cell in s.cells.iter_mut() {
-                    *cell = blank.clone();
+                    *cell = blank;
                 }
             }
             _ => {}
@@ -428,7 +428,7 @@ impl EmulatorState {
         if alt {
             let blank = self.current_cell();
             for cell in self.alt.cells.iter_mut() {
-                *cell = blank.clone();
+                *cell = blank;
             }
             self.alt.cursor_col = 0;
             self.alt.cursor_row = 0;
@@ -517,7 +517,7 @@ impl EmulatorState {
         let blank = self.current_cell();
         self.primary
             .cells
-            .resize((cols as usize) * (rows as usize), blank.clone());
+            .resize((cols as usize) * (rows as usize), blank);
         self.alt
             .cells
             .resize((cols as usize) * (rows as usize), blank);
@@ -547,7 +547,7 @@ impl EmulatorState {
     fn reset_primary(&mut self) {
         let blank = blank_cell();
         for cell in self.primary.cells.iter_mut() {
-            *cell = blank.clone();
+            *cell = blank;
         }
         self.primary.cursor_col = 0;
         self.primary.cursor_row = 0;
@@ -588,7 +588,7 @@ impl Perform for EmulatorState {
         match byte {
             0x08 => self.backspace(),              // BS
             0x09 => self.tab(),                    // HT
-            0x0A | 0x0B | 0x0C => self.linefeed(), // LF, VT, FF
+            0x0A..=0x0C => self.linefeed(), // LF, VT, FF
             0x0D => self.cursor_carriage_return(), // CR
             0x07 => {}                             // BEL — silent
             _ => {}
@@ -677,7 +677,7 @@ impl Perform for EmulatorState {
                 let bot = it
                     .next()
                     .and_then(|p| p.first().copied())
-                    .unwrap_or(self.rows as u16);
+                    .unwrap_or(self.rows);
                 let bot = bot.max(1) - 1;
                 self.scroll_top = top.min(self.rows.saturating_sub(1));
                 self.scroll_bot = bot.min(self.rows.saturating_sub(1));
@@ -714,10 +714,10 @@ impl Perform for EmulatorState {
                 self.scroll_bot = self.rows.saturating_sub(1);
                 let blank = self.current_cell();
                 for cell in self.primary.cells.iter_mut() {
-                    *cell = blank.clone();
+                    *cell = blank;
                 }
                 for cell in self.alt.cells.iter_mut() {
-                    *cell = blank.clone();
+                    *cell = blank;
                 }
                 self.primary.cursor_col = 0;
                 self.primary.cursor_row = 0;
