@@ -743,9 +743,10 @@ impl TerminalProvider {
 
     fn dashboard_key(&mut self, key: DashboardKey) -> bool {
         if let Some(bytes) = encode_dashboard_key(&key)
-            && let Some(shell) = self.shell.as_mut() {
-                let _ = shell.write_input(&bytes);
-            }
+            && let Some(shell) = self.shell.as_mut()
+        {
+            let _ = shell.write_input(&bytes);
+        }
         // Always request redraw — the shell may produce output before the
         // next tick and we want the cursor blink to keep up.
         true
@@ -1215,13 +1216,14 @@ fn expand_home(value: &str) -> PathBuf {
         None
     };
     if let Some(rest) = rest
-        && let Some(home) = sys::home_dir() {
-            return if rest.is_empty() {
-                home
-            } else {
-                home.join(rest)
-            };
-        }
+        && let Some(home) = sys::home_dir()
+    {
+        return if rest.is_empty() {
+            home
+        } else {
+            home.join(rest)
+        };
+    }
     PathBuf::from(value)
 }
 
@@ -2709,10 +2711,10 @@ mod tests {
                     .unwrap()
                     .output
                     .contains("terminal-it-test")
-                {
-                    saw_output = true;
-                    break;
-                }
+            {
+                saw_output = true;
+                break;
+            }
             thread::sleep(Duration::from_millis(20));
         }
         assert!(

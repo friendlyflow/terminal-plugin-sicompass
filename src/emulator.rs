@@ -588,7 +588,7 @@ impl Perform for EmulatorState {
         match byte {
             0x08 => self.backspace(),              // BS
             0x09 => self.tab(),                    // HT
-            0x0A..=0x0C => self.linefeed(), // LF, VT, FF
+            0x0A..=0x0C => self.linefeed(),        // LF, VT, FF
             0x0D => self.cursor_carriage_return(), // CR
             0x07 => {}                             // BEL — silent
             _ => {}
