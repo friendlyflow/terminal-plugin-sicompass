@@ -1,4 +1,4 @@
-# terminal_plugin_sicompass
+# terminal-plugin-sicompass
 
 *A real shell, in Sicompass.*
 
