@@ -51,7 +51,7 @@ GitHub releases, one build per platform. The plugin platform is described in
 - A typed `cd` moves the plugin without a navigation call. The SDK's runtime
   tells the app after every call that moved it, so nothing here has to.
 - stdout is the channel to the app. `println!` lands in stderr, the app's log.
-  Every call from the app has a 10-second deadline.
+  The app waits for every call to answer, drawing nothing meanwhile.
 
 ## Environment (Nix)
 
