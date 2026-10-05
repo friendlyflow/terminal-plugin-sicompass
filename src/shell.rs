@@ -130,12 +130,12 @@ impl Shell {
                                 if let Ok(mut o) = output.lock() {
                                     o.extend_from_slice(chunk);
                                 }
-                                let hits = count_dsr(&mut tail, chunk);
-                                if hits > 0
+                                let replies = query_replies(&mut tail, chunk);
+                                if !replies.is_empty()
                                     && let Ok(mut w) = writer.lock()
                                 {
-                                    for _ in 0..hits {
-                                        let _ = w.write_all(DSR_REPLY);
+                                    for reply in replies {
+                                        let _ = w.write_all(reply);
                                     }
                                     let _ = w.flush();
                                 }
@@ -193,21 +193,29 @@ impl Shell {
     }
 
     /// Whether a foreground command (something other than the shell itself)
-    /// is running on the PTY: the terminal's foreground process group
-    /// (`tcgetpgrp` on the master) is not the shell's own. The shell leads its
-    /// own session and group, and job control hands the terminal to each
-    /// command it runs. Never busy on Windows, where ConPTY has no such thing.
+    /// is running on the PTY. Never busy where that cannot be told; see
+    /// [`program_in_foreground`](Self::program_in_foreground).
     pub fn foreground_busy(&self) -> bool {
+        self.program_in_foreground().unwrap_or(false)
+    }
+
+    /// Whether a program the shell started holds the terminal: the terminal's
+    /// foreground process group (`tcgetpgrp` on the master) is not the shell's
+    /// own. The shell leads its own session and group, and job control hands
+    /// the terminal to each command it runs, so this holds for any shell.
+    ///
+    /// `None` when it cannot be told: on Windows, where ConPTY has no process
+    /// groups, or when the pid or group is unavailable.
+    pub fn program_in_foreground(&self) -> Option<bool> {
         #[cfg(unix)]
         {
-            let (Some(pid), Some(leader)) = (self.pid(), self.master.process_group_leader()) else {
-                return false;
-            };
-            i64::from(leader) != i64::from(pid)
+            let pid = self.pid()?;
+            let leader = self.master.process_group_leader()?;
+            Some(i64::from(leader) != i64::from(pid))
         }
         #[cfg(not(unix))]
         {
-            false
+            None
         }
     }
 
@@ -400,26 +408,68 @@ const DSR_QUERY: &[u8] = b"\x1b[6n";
 /// cmd.exe under ConPTY blocks its prompt until it gets *some* valid reply.
 const DSR_REPLY: &[u8] = b"\x1b[1;1R";
 
-/// How many DSR queries `tail` + `chunk` hold, keeping the end of the chunk in
-/// `tail` in case the next query straddles two reads.
-fn count_dsr(tail: &mut Vec<u8>, chunk: &[u8]) -> usize {
+/// The answer to a primary device attributes query (`CSI c` or `CSI 0 c`,
+/// "what kind of terminal is this?"): a VT220 with ANSI colour, which every
+/// xterm-compatible program accepts.
+///
+/// fish 4 ends its startup probe with DA1 and treats the answer as "no more
+/// replies are coming": without one it waits 10 seconds before its first
+/// prompt and then warns that the terminal is missing a feature.
+const DA1_REPLY: &[u8] = b"\x1b[?62;22c";
+
+/// The queries the reader thread answers, each with its reply.
+///
+/// DA1 only off Windows: ConPTY answers it itself, and a second reply would
+/// reach the program as typed input.
+const ANSWERED: &[(&[u8], &[u8])] = &[
+    (DSR_QUERY, DSR_REPLY),
+    #[cfg(not(windows))]
+    (b"\x1b[c", DA1_REPLY),
+    #[cfg(not(windows))]
+    (b"\x1b[0c", DA1_REPLY),
+];
+
+/// The longest query in [`ANSWERED`]: how much of a chunk's end might be the
+/// start of a query the next read completes.
+const LONGEST_QUERY: usize = 4;
+
+/// The replies to the queries `tail` + `chunk` hold, in the order they were
+/// asked, keeping the end of the chunk in `tail` in case the next query
+/// straddles two reads.
+fn query_replies(tail: &mut Vec<u8>, chunk: &[u8]) -> Vec<&'static [u8]> {
     let mut scan = std::mem::take(tail);
     scan.extend_from_slice(chunk);
-    let mut hits = 0;
+    let mut replies = Vec::new();
+    // Where the last answered query ended.
+    let mut answered = 0;
     let mut i = 0;
-    while i + DSR_QUERY.len() <= scan.len() {
-        if &scan[i..i + DSR_QUERY.len()] == DSR_QUERY {
-            hits += 1;
-            i += DSR_QUERY.len();
-        } else {
-            i += 1;
+    while i < scan.len() {
+        match ANSWERED
+            .iter()
+            .find(|(query, _)| scan[i..].starts_with(query))
+        {
+            Some((query, reply)) => {
+                replies.push(*reply);
+                i += query.len();
+                answered = i;
+            }
+            None => i += 1,
         }
     }
-    let keep = scan.len().min(DSR_QUERY.len() - 1);
-    // A query already counted must not be counted again with the next chunk.
-    let from = (scan.len() - keep).max(i.min(scan.len()));
+    let keep = scan.len().min(LONGEST_QUERY - 1);
+    // A query already answered must not be answered again with the next chunk.
+    let from = (scan.len() - keep).max(answered);
     tail.extend_from_slice(&scan[from..]);
-    hits
+    replies
+}
+
+/// How many DSR queries `tail` + `chunk` hold; see [`query_replies`].
+#[cfg(test)]
+fn count_dsr(tail: &mut Vec<u8>, chunk: &[u8]) -> usize {
+    query_replies(tail, chunk)
+        .into_iter()
+        .filter(|reply| *reply == DSR_REPLY)
+        .count()
 }
 
 /// The shell to run when the user has not picked one: [`LOGIN_SHELL`],
@@ -673,6 +723,96 @@ mod tests {
         assert_eq!(count_dsr(&mut tail, b"x\x1b["), 0);
         assert_eq!(count_dsr(&mut tail, b"6ny"), 1, "straddling two reads");
         assert_eq!(count_dsr(&mut tail, b"\x1b[6n\x1b[6n"), 2);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_da1_query_is_answered_in_either_spelling_and_across_reads() {
+        let mut tail = Vec::new();
+        assert_eq!(query_replies(&mut tail, b"a\x1b[cb"), vec![DA1_REPLY]);
+        assert_eq!(query_replies(&mut tail, b"\x1b[0c"), vec![DA1_REPLY]);
+        assert!(
+            query_replies(&mut tail, b"z").is_empty(),
+            "not answered again"
+        );
+        assert!(query_replies(&mut tail, b"x\x1b[0").is_empty());
+        assert_eq!(
+            query_replies(&mut tail, b"cy"),
+            vec![DA1_REPLY],
+            "straddling two reads"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn replies_follow_the_order_of_the_queries() {
+        // fish asks for the cursor and then DA1 at every prompt.
+        let mut tail = Vec::new();
+        assert_eq!(
+            query_replies(&mut tail, b"\x1b]11;?\x1b\\\x1b[6n\x1b[0c"),
+            vec![DSR_REPLY, DA1_REPLY],
+        );
+        assert_eq!(
+            query_replies(&mut tail, b"\x1b[c\x1b[6n"),
+            vec![DA1_REPLY, DSR_REPLY],
+        );
+    }
+
+    #[test]
+    fn other_device_attribute_sequences_are_not_answered() {
+        let mut tail = Vec::new();
+        // DA2, a DA1 *reply* echoed back, DA3, and a CSI ending in `c` that
+        // is not a query at all.
+        for bytes in [
+            &b"\x1b[>c"[..],
+            b"\x1b[>0c",
+            b"\x1b[?1;2c",
+            b"\x1b[=c",
+            b"\x1b[10c",
+        ] {
+            assert!(query_replies(&mut tail, bytes).is_empty(), "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn longest_query_covers_every_answered_query() {
+        assert_eq!(
+            ANSWERED.iter().map(|(query, _)| query.len()).max(),
+            Some(LONGEST_QUERY)
+        );
+    }
+
+    /// fish 4 waits 10 seconds for a DA1 reply before its first prompt. With
+    /// the reply it prompts at once. Skipped where fish is not installed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fish_prompts_without_waiting_for_a_reply() {
+        let on_path = std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join("fish").is_file()));
+        if !on_path {
+            eprintln!("fish is not on PATH, skipping");
+            return;
+        }
+        let cfg = ShellConfig {
+            program: "fish".to_owned(),
+            args: vec!["--no-config".to_owned()],
+            ..Default::default()
+        };
+        let mut shell = Shell::spawn(cfg).expect("spawn fish");
+        // OSC 133;A marks the start of fish's prompt.
+        const PROMPT: &[u8] = b"\x1b]133;A";
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut out = Vec::new();
+        while Instant::now() < deadline && !out.windows(PROMPT.len()).any(|w| w == PROMPT) {
+            out.extend(shell.drain_output());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let text = String::from_utf8_lossy(&out);
+        assert!(!text.contains("could not read response"), "{text}");
+        assert!(
+            text.contains("\x1b]133;A"),
+            "no prompt within 5 s: {text:?}"
+        );
     }
 
     #[cfg(target_os = "linux")]

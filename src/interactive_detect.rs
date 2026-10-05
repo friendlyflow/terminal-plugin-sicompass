@@ -28,6 +28,14 @@
 //! about a child program. Cursor visibility (`25`) is excluded for the same
 //! reason.
 //!
+//! **The shell itself is never a trigger,** whatever modes it sets. fish 4
+//! probes the terminal at startup inside `CSI ?1049h … CSI ?1049l`, and any
+//! shell or prompt plugin may switch focus or mouse reporting on for its own
+//! line editor. Excluding modes one by one cannot keep up with every shell, so
+//! the caller says whether a program the shell started holds the terminal
+//! ([`InteractiveDetector::feed_while`]), and a mode *set* while it does not is
+//! not recorded. Resets always apply.
+//!
 //! The detector tracks the *set* of interactive modes currently enabled and
 //! emits `Enter` when that set becomes non-empty and `Leave` when it drains
 //! back to empty — so a TUI that enables several modes at once (e.g. alt
@@ -107,8 +115,26 @@ impl InteractiveDetector {
         }
     }
 
+    /// [`feed_while`](Self::feed_while) with a program assumed to be running:
+    /// every interactive mode the bytes set counts.
+    #[cfg(test)]
+    pub fn feed(&mut self, bytes: &[u8], emit: impl FnMut(InteractiveEvent)) {
+        self.feed_while(bytes, true, emit);
+    }
+
     /// Feed bytes; invoke `emit` for every Enter/Leave transition seen.
-    pub fn feed(&mut self, bytes: &[u8], mut emit: impl FnMut(InteractiveEvent)) {
+    ///
+    /// `program_running` is whether a program the shell started holds the
+    /// terminal. When it is false the bytes are the shell's own, and a mode
+    /// they set is ignored: it is the shell's prompt or line editor, not a
+    /// full-terminal program. It must not enter the set either, or a later real
+    /// program would find it non-empty and never yield an Enter.
+    pub fn feed_while(
+        &mut self,
+        bytes: &[u8],
+        program_running: bool,
+        mut emit: impl FnMut(InteractiveEvent),
+    ) {
         for &b in bytes {
             match self.state {
                 State::Ground => {
@@ -152,8 +178,12 @@ impl InteractiveDetector {
                         }
                         let on = b == b'h';
                         let params = std::mem::take(&mut self.params);
-                        for p in params {
-                            self.apply_mode(p, on, &mut emit);
+                        // A set with no program running is the shell's own;
+                        // see `feed_while`.
+                        if !on || program_running {
+                            for p in params {
+                                self.apply_mode(p, on, &mut emit);
+                            }
                         }
                         self.state = State::Ground;
                         self.cur = 0;
@@ -192,7 +222,7 @@ impl InteractiveDetector {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn collect(input: &[u8]) -> Vec<InteractiveEvent> {
@@ -339,5 +369,61 @@ mod tests {
             collect(b"\x1b[?1049x\x1b[?1049h"),
             vec![InteractiveEvent::Enter],
         );
+    }
+
+    /// What fish 4.7 writes before its first prompt, captured from a PTY with
+    /// `fish --no-config -i`: kitty keyboard, XTVERSION and background-colour
+    /// queries, then XTGETTCAP inside an alternate-screen bracket, then DA1.
+    pub(crate) const FISH_STARTUP: &[u8] = b"\x1b[?u\x1b[>0q\x1b]11;?\x1b\\\
+        \x1b[?1049h\x1bP+q696e646e\x1b\\\x1bP+q71756572792d6f732d6e616d65\x1b\\\
+        \x1b[?1049l\x1b[0c";
+
+    fn collect_while(program_running: bool, input: &[u8]) -> Vec<InteractiveEvent> {
+        let mut d = InteractiveDetector::new();
+        let mut out = Vec::new();
+        d.feed_while(input, program_running, |e| out.push(e));
+        out
+    }
+
+    #[test]
+    fn a_mode_the_shell_sets_for_itself_is_not_a_program() {
+        assert_eq!(collect_while(false, b"\x1b[?1049h"), vec![]);
+        assert_eq!(collect_while(false, b"\x1b[?1000;1006h"), vec![]);
+        assert_eq!(collect_while(false, FISH_STARTUP), vec![]);
+    }
+
+    #[test]
+    fn fish_startup_counts_when_a_program_is_said_to_be_running() {
+        // The bytes alone cannot tell fish from vim; only the caller's
+        // `program_running` does.
+        assert_eq!(
+            collect_while(true, FISH_STARTUP),
+            vec![InteractiveEvent::Enter, InteractiveEvent::Leave],
+        );
+    }
+
+    #[test]
+    fn a_reset_applies_whoever_is_in_the_foreground() {
+        // A program set the alt screen, and the shell was back in the
+        // foreground by the time its exit was read.
+        let mut d = InteractiveDetector::new();
+        let mut events = Vec::new();
+        d.feed_while(b"\x1b[?1049h", true, |e| events.push(e));
+        d.feed_while(b"\x1b[?1049l", false, |e| events.push(e));
+        assert_eq!(
+            events,
+            vec![InteractiveEvent::Enter, InteractiveEvent::Leave]
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn a_mode_left_on_by_the_shell_does_not_hide_a_later_program() {
+        // A prompt that turns focus reporting on and leaves it on, then vim.
+        let mut d = InteractiveDetector::new();
+        let mut events = Vec::new();
+        d.feed_while(b"\x1b[?1004h", false, |e| events.push(e));
+        d.feed_while(b"\x1b[?1049h", true, |e| events.push(e));
+        assert_eq!(events, vec![InteractiveEvent::Enter]);
     }
 }

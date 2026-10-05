@@ -254,16 +254,27 @@ impl TerminalProvider {
         if !self.auto_enter_dashboard {
             return;
         }
+        // Only a program the shell started can open the dashboard: a mode the
+        // shell sets for its own prompt (fish probes the terminal inside an
+        // alternate-screen bracket at startup) is not one. Where that cannot be
+        // told (Windows, or no shell yet) the bytes are trusted, and
+        // `handle_interactive_event` still drops an enter-then-leave probe.
+        let program_running = self
+            .shell
+            .as_ref()
+            .and_then(|s| s.program_in_foreground())
+            .unwrap_or(true);
         // Two-phase: collect events under the &mut self.interactive_detect
         // borrow, then dispatch on &mut self.
         let mut events: [Option<InteractiveEvent>; 4] = [None; 4];
         let mut n = 0;
-        self.interactive_detect.feed(bytes, |e| {
-            if n < events.len() {
-                events[n] = Some(e);
-                n += 1;
-            }
-        });
+        self.interactive_detect
+            .feed_while(bytes, program_running, |e| {
+                if n < events.len() {
+                    events[n] = Some(e);
+                    n += 1;
+                }
+            });
         for e in events.iter().take(n).flatten() {
             self.handle_interactive_event(*e);
         }
@@ -281,6 +292,14 @@ impl TerminalProvider {
             }
             InteractiveEvent::Leave if self.in_dashboard && self.auto_entered_dashboard => {
                 self.pending_dashboard_request = Some(DashboardRequest::Leave);
+            }
+            // Gone before the app acted on the Enter: a probe of the terminal,
+            // not a program to hand the screen to.
+            InteractiveEvent::Leave
+                if self.pending_dashboard_request == Some(DashboardRequest::Enter) =>
+            {
+                self.pending_dashboard_request = None;
+                self.auto_entered_dashboard = false;
             }
             // Ignore Enter while already in dashboard and Leave when the user
             // manually pressed `d` — those exit only on Esc.
@@ -2616,6 +2635,87 @@ mod tests {
         p.drive_interactive_detector(b"?10");
         p.drive_interactive_detector(b"49h");
         assert_eq!(p.take_dashboard_request(), Some(DashboardRequest::Enter));
+    }
+
+    #[test]
+    fn an_enter_gone_before_the_app_acted_is_a_probe() {
+        // fish's startup bytes, read where it cannot be told whether the shell
+        // or a program wrote them (Windows, or this provider with no PTY).
+        let mut p = shell_view();
+        p.drive_interactive_detector(crate::interactive_detect::tests::FISH_STARTUP);
+        assert_eq!(p.take_dashboard_request(), None);
+        assert!(!p.auto_entered_dashboard);
+
+        // Split over two reads, the same.
+        let mut q = shell_view();
+        q.drive_interactive_detector(b"\x1b[?1049h");
+        q.drive_interactive_detector(b"\x1b[?1049l");
+        assert_eq!(q.take_dashboard_request(), None);
+        assert!(!q.auto_entered_dashboard);
+    }
+
+    /// Ticks until `done` or 5 seconds pass.
+    #[cfg(target_os = "linux")]
+    fn tick_until(
+        p: &mut TerminalProvider,
+        mut done: impl FnMut(&mut TerminalProvider) -> bool,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            p.tick();
+            if done(p) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// A real shell in its list view, as `:` leaves it.
+    #[cfg(target_os = "linux")]
+    fn real_shell_view() -> Option<TerminalProvider> {
+        let mut p = TerminalProvider::new();
+        p.on_setting_change("shellProgram", "/bin/sh");
+        p.browse_path = std::env::temp_dir();
+        p.enter_shell();
+        p.shell.is_some().then_some(p)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_shell_setting_the_alt_screen_itself_opens_no_dashboard() {
+        let Some(mut p) = real_shell_view() else {
+            return;
+        };
+        // `printf` is a builtin: the shell itself writes the sequence, the way
+        // fish does at startup.
+        assert!(p.commit_edit("", "printf '\\033[?1049h'; echo shell-own-marker"));
+        let mut requests = Vec::new();
+        let printed = tick_until(&mut p, |p| {
+            requests.extend(p.take_dashboard_request());
+            p.entries
+                .last()
+                .is_some_and(|e| e.output.contains("shell-own-marker"))
+        });
+        assert!(printed, "the command never ran");
+        assert_eq!(requests, vec![]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_program_setting_the_alt_screen_opens_the_dashboard() {
+        let Some(mut p) = real_shell_view() else {
+            return;
+        };
+        // A child of the shell, holding the terminal while it runs.
+        assert!(p.commit_edit("", "sh -c 'printf \"\\033[?1049h\"; sleep 2'"));
+        let entered = tick_until(&mut p, |p| {
+            p.take_dashboard_request() == Some(DashboardRequest::Enter)
+        });
+        assert!(
+            entered,
+            "no dashboard for a program on the alternate screen"
+        );
     }
 
     #[cfg(unix)]
