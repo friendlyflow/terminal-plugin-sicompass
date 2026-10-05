@@ -8,10 +8,11 @@ whose `/commit-and-push`, `/release`, `/sync` and `/update-cargo` take this
 repo's name as their first argument and then follow the skills in this repo's
 `.claude/skills/`.
 
-It is a sicompass **WASM plugin**: a `cdylib` built for `wasm32-wasip2` with
-`sicompass-pdk`, installed by the sicompass Store from this repo's GitHub
-releases. The plugin platform is described in
-`../sicompass/docs/plugin-platform.md` and `../sicompass/docs/wasm-plugins.md`.
+It is a sicompass **plugin process**: a program (`src/main.rs`) built with the
+SDK's `plugin` feature, which sicompass starts and talks to over its stdin and
+stdout. It runs with the user's rights. The Store installs it from this repo's
+GitHub releases, one build per platform. The plugin platform is described in
+`../sicompass/docs/plugin-platform.md`.
 
 - `plugin.json` is the manifest. Its `name` is `terminal` (the app gives
   `:` and the live input slot special treatment by that name, so it must not
@@ -19,33 +20,45 @@ releases. The plugin platform is described in
   (`shellProgram`, `commandHistorySize`, `scrollbackSize`,
   `autoEnterDashboard`, the keys the built-in had). It asks for `storage` (the
   recall history), `"filesystem": ["/"]` and the shells by name (`$SHELL` is
-  the login shell), which the user approves at install.
+  the login shell). They are what the plugin declares it does, shown to the
+  user before install.
 - `locales/<lang>.ftl`, every id prefixed `terminal-`, in all four
   languages.
 
-## The sandbox, and what it changes
+## How it runs
 
-- **The shell** is `src/shell.rs`: the host's `process` with a PTY in the
-  sandbox, portable-pty natively. `Shell::cwd` and `Shell::foreground_busy` are
-  the host's `child.cwd` and `child.foreground-busy` (Linux, from `/proc`).
-  A process can no longer be renamed for process monitors.
-- **`shellProgram` is a name** the manifest lists. A path saved by the
-  built-in is taken by its file name (`program_name`).
-- **The prompt** needs the user, the host and the home folder, and the
-  plugin's own environment is empty, so `src/sys.rs` asks `sh` once.
-- **The recall history** is `/storage/history`, the plugin's storage folder.
-  No test may reach it: `TEST_NO_HISTORY` defaults on under `cfg(test)`.
+- **The shell** is `src/shell.rs`: portable-pty (ConPTY on Windows), a child
+  of the plugin's process, read by a thread so no call from the app waits on
+  it. Its pid goes to the app in `PollResult::child_pid`, which the tab
+  switcher names the tab after. `Shell::cwd` is `/proc/<pid>/cwd` on Linux and
+  `proc_pidinfo` on macOS (none on Windows). `Shell::foreground_busy` compares
+  the PTY's foreground process group (`tcgetpgrp` on the master) with the
+  shell's pid (never busy on Windows).
+- **`shellProgram`** is `$SHELL` (the login shell: `$SHELL` from the
+  environment, then the account's entry, then `/bin/sh`, and on Windows
+  `%ComSpec%`, then PowerShell), a name (found on `PATH`, then in
+  `~/.local/bin`), or a path.
+- **The prompt** needs the user, the host and the home folder: `src/sys.rs`
+  reads the environment, and the host name from `gethostname`.
+- **The recall history** is `history` in the plugin's storage folder
+  (`sicompass_sdk::plugin::storage_dir`). No test may reach it:
+  `TEST_NO_HISTORY` defaults on under `cfg(test)`.
 - **The interactive dashboard** is the SDK's `DashboardFrame` from the vte
-  emulator, handed to the host with `.into()` (the pdk converts, and keys the
+  emulator, handed to the app with `.into()` (the SDK converts, and keys the
   other way).
-- A typed `cd` moves the plugin without a navigation call. The pdk's
-  `export_plugin!` tells the host (`host.moved-to`), so nothing here has to.
+- **Strings** come from the app (`host::translate`). The unit tests run
+  outside sicompass and read the English bundle instead (`src/localize.rs`).
+- A typed `cd` moves the plugin without a navigation call. The SDK's runtime
+  tells the app after every call that moved it, so nothing here has to.
+- stdout is the channel to the app. `println!` lands in stderr, the app's log.
+  Every call from the app has a 10-second deadline.
 
 ## Environment (Nix)
 
 The toolchain comes from the flake dev shell in [flake.nix](flake.nix): Rust
-from rust-overlay with the `wasm32-wasip2` target (nixpkgs' rustc has no `std`
-for it), `wasm-tools` and `jq`. Nothing is installed system-wide.
+from rust-overlay with this computer's plugin target (static musl on Linux,
+which nixpkgs' rustc has no `std` for) and `jq`. Nothing is installed
+system-wide.
 
 - **Check once per session**, then stick with the answer: `command -v cargo`.
   - Non-empty: the shell is inside `nix develop`, so run `cargo ...` directly.
@@ -73,8 +86,8 @@ instead, or split into separate sentences.
 ## Testing
 
 - After implementing changes, always run the tests before finishing:
-  `cargo test` (natively), and `./scripts/release-plugin.sh --dry-run`, which
-  also builds the component and audits its imports.
+  `cargo test`, and `./scripts/release-plugin.sh --dry-run`, which also builds
+  this computer's release and verifies it the way the Store will.
 - When adding new code, write or update tests.
 - If tests fail, fix the code. Never leave a task with failing tests.
 
@@ -97,6 +110,10 @@ against the `PLUGIN_PUBLIC_KEY` variable, the key the sicompass store list
 names. The secret key file is `~/.config/sicompass/plugin-keys/terminal.key`
 on the maintainer's machine. Never print, copy or commit it.
 
-The SDK and the pdk come from crates.io (the source is
-`../sicompass-plugin-sdk`). The commented-out `[patch]` in `Cargo.toml` is for
-working on them together, and stays commented on main.
+The SDK comes from crates.io (the source is `../sicompass-plugin-sdk`). The
+commented-out `[patch]` in `Cargo.toml` is for working on them together, and
+stays commented on main.
+
+A release has one archive per platform. The release workflow builds them on
+five runners (Linux x86_64 and arm64 as static musl, macOS arm64 and x86_64,
+Windows x86_64), then packs, signs and verifies them in one job.

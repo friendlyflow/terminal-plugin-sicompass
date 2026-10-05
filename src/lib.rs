@@ -26,9 +26,8 @@
 //!   `DashboardFrame` every frame. This is the path that makes `vim`, `less`,
 //!   `htop`, and `claude` usable.
 //!
-//! The shell itself is [`shell::Shell`]: inside the sandbox a program the
-//! host runs on a PTY (`process`, which `plugin.json` asks for), natively a
-//! portable-pty one for the tests.
+//! The shell itself is [`shell::Shell`]: the user's shell on a portable-pty
+//! PTY (ConPTY on Windows), a child of this plugin's process.
 
 mod emulator;
 mod fsx;
@@ -42,7 +41,7 @@ use std::path::{Path, PathBuf};
 use emulator::{Emulator, encode_dashboard_key};
 use interactive_detect::{InteractiveDetector, InteractiveEvent};
 use shell::{Shell, ShellConfig, default_program};
-use sicompass_pdk::{Descriptor, FfonElement, Frame, Key, Plugin, PollResult, export_plugin};
+use sicompass_sdk::plugin::{Descriptor, FfonElement, Frame, Key, Plugin, PollResult};
 use sicompass_sdk::{DashboardFrame, DashboardKey, DashboardRequest};
 
 // ---------------------------------------------------------------------------
@@ -314,9 +313,8 @@ impl TerminalProvider {
         if test_no_history() {
             return None;
         }
-        // `permissions.storage`: the host's folder for this plugin.
-        cfg!(target_arch = "wasm32")
-            .then(|| PathBuf::from(sicompass_pdk::STORAGE_DIR).join("history"))
+        // `permissions.storage`: the app's folder for this plugin.
+        sicompass_sdk::plugin::storage_dir().map(|d| d.join("history"))
     }
 
     /// Read the recall-history file, keep the last `command_history_size`
@@ -606,8 +604,8 @@ impl TerminalProvider {
     /// those have proven unreliable across shells, locales, and rc-file edge
     /// cases (literal backslashes, missing prompt on first entry, ...).
     /// Synthesizing in-process gives us a stable, predictable prompt that
-    /// updates after `cd` where the host can see the shell's directory
-    /// (Linux); elsewhere the prompt follows the `cd`s it parses.
+    /// updates after `cd` where the system tells the shell's directory
+    /// (Linux, macOS); elsewhere the prompt follows the `cd`s it parses.
     fn current_prompt(&self) -> String {
         let cwd = self.shell_cwd();
         if sys::is_windows() {
@@ -620,7 +618,7 @@ impl TerminalProvider {
     }
 
     /// The shell child's current working directory, where the system says
-    /// (Linux, through the host). Elsewhere the prompt does not auto-update
+    /// (Linux and macOS, see `Shell::cwd`). Elsewhere the prompt does not auto-update
     /// after a `cd` it could not parse: it falls back to the last parsed or
     /// initial cwd (or home, or `/`).
     fn shell_cwd(&self) -> String {
@@ -655,9 +653,8 @@ impl TerminalProvider {
         localize::t("terminal-display-name")
     }
 
-    /// OS process id of the child shell, if started (natively; inside the
-    /// sandbox the host reports it to the tab switcher itself).
-    #[cfg(test)]
+    /// OS process id of the child shell, if started. The app's tab switcher
+    /// names the tab after it.
     fn process_id(&self) -> Option<u32> {
         self.shell.as_ref().and_then(|s| s.pid())
     }
@@ -792,7 +789,7 @@ impl Plugin for TerminalProvider {
             display_name: self.display_name(),
             version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             path_is_filesystem: true,
-            dashboard_kind: sicompass_pdk::DashboardKind::Interactive,
+            dashboard_kind: sicompass_sdk::plugin::DashboardKind::Interactive,
             // Entry is always automatic — `interactive_detect` enters when a
             // full-terminal program starts and leaves when it exits. A manual
             // `d` at a bare shell prompt would have no clean exit path because
@@ -812,9 +809,10 @@ impl Plugin for TerminalProvider {
             is_busy: self.is_busy(),
             at_root: self.at_root(),
             dashboard_request: self.take_dashboard_request().map(|r| match r {
-                DashboardRequest::Enter => sicompass_pdk::DashboardRequest::Enter,
-                DashboardRequest::Leave => sicompass_pdk::DashboardRequest::Leave,
+                DashboardRequest::Enter => sicompass_sdk::plugin::DashboardRequest::Enter,
+                DashboardRequest::Leave => sicompass_sdk::plugin::DashboardRequest::Leave,
             }),
+            child_pid: self.process_id(),
             ..Default::default()
         }
     }
@@ -825,16 +823,16 @@ impl Plugin for TerminalProvider {
     fn init(&mut self) {
         self.view = View::Browse;
         self.browse_path = PathBuf::from("/");
-        // The settings `plugin.json` declares, from the host. (The unit tests
-        // set them through `on_setting_change`.)
-        #[cfg(target_arch = "wasm32")]
+        // The settings `plugin.json` declares, from the app. (Outside
+        // sicompass there are none, and the unit tests set them through
+        // `on_setting_change`.)
         for key in [
             SETTING_SHELL,
             "scrollbackSize",
             "commandHistorySize",
             "autoEnterDashboard",
         ] {
-            if let Some(v) = sicompass_pdk::host::get_setting(key) {
+            if let Some(v) = sicompass_sdk::plugin::host::get_setting(key) {
                 self.on_setting_change(key, &v);
             }
         }
@@ -965,7 +963,7 @@ impl Plugin for TerminalProvider {
     // For this provider the app routes `:` straight to `handle_command("shell")`
     // rather than opening the command palette, so these are normally invoked
     // without the list ever being drawn. They are still implemented properly:
-    // the WASM plugin bridge and the tests reach the terminal through the
+    // the plugin channel and the tests reach the terminal through the
     // generic command path, and `commands()` is what tells the app which of the
     // two transitions is currently available — that is how the app decides
     // whether `:` should enter or leave the shell without querying view state.
@@ -1130,28 +1128,15 @@ impl Plugin for TerminalProvider {
 /// The setting (declared in `plugin.json`) naming the shell.
 const SETTING_SHELL: &str = "shellProgram";
 
-/// The program to ask the host for, from the `shellProgram` setting.
-///
-/// The host starts only a name `plugin.json` lists, never a path. An empty
-/// value is the login shell. A path (which is what the setting held when the
-/// terminal came with the app) is taken by its file name, which `PATH`
-/// resolves to the same shell on any ordinary system.
+/// The program to start, from the `shellProgram` setting: `$SHELL` (the
+/// login shell), a name, or a path. An empty value is the login shell.
 fn program_name(value: &str) -> String {
     let value = value.trim();
     if value.is_empty() {
         return default_program();
     }
-    if !cfg!(target_arch = "wasm32") || value == "$SHELL" {
-        return value.to_owned();
-    }
-    Path::new(value)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n.strip_suffix(".exe").unwrap_or(n).to_owned())
-        .unwrap_or_else(default_program)
+    value.to_owned()
 }
-
-export_plugin!(TerminalProvider);
 
 /// Render an entry's output as a list of child lines, stripping the noise
 /// produced by the PTY around the actual command output:
@@ -1843,6 +1828,8 @@ mod tests {
     }
 
     /// The `Str` rows of the shell view — everything above the `+i` input slot.
+    /// Only the Unix tests read them.
+    #[cfg(unix)]
     fn scrollback_rows(p: &mut TerminalProvider) -> Vec<String> {
         p.fetch()
             .iter()
@@ -2507,7 +2494,7 @@ mod tests {
         let p = TerminalProvider::new();
         assert!(matches!(
             p.describe().dashboard_kind,
-            sicompass_pdk::DashboardKind::Interactive
+            sicompass_sdk::plugin::DashboardKind::Interactive
         ));
     }
 
