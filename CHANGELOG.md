@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1
+
+- The shell itself never opens the dashboard. Only a program running in the
+  foreground does.
+- fish no longer waits 10 seconds when it starts: the terminal now answers its
+  device attributes query.
+
 ## 0.3.0
 
 Terminal is a program of its own now, instead of a sandboxed WebAssembly component.
