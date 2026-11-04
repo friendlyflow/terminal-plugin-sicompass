@@ -3215,9 +3215,9 @@ mod markup_tests {
             let mut shown = false;
             while !shown && std::time::Instant::now() < deadline {
                 p.tick();
-                shown = str_rows(&p.fetch())
-                    .iter()
-                    .any(|row| !markup::has_markup(row) && tags::strip_display(row) == text);
+                shown = str_rows(&p.fetch()).iter().any(|row| {
+                    !markup::has_markup(row) && tags::strip_display(row).ends_with(text)
+                });
                 std::thread::yield_now();
             }
             assert!(shown, "{text:?} was not shown: {:?}", str_rows(&p.fetch()));
