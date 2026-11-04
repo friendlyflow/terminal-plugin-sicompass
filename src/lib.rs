@@ -30,6 +30,7 @@
 //! PTY (ConPTY on Windows), a child of this plugin's process.
 
 mod emulator;
+mod escape;
 mod fsx;
 mod interactive_detect;
 mod localize;
@@ -429,7 +430,7 @@ impl TerminalProvider {
         names.sort_by(|a, b| natord::compare_ignore_case(a, b));
         names
             .into_iter()
-            .map(|n| FfonElement::new_obj(&n))
+            .map(|n| FfonElement::new_obj(escape::escape(&n)))
             .collect()
     }
 
@@ -557,29 +558,51 @@ impl TerminalProvider {
         let live_prompt = self.current_prompt();
         let mut out: Vec<FfonElement> = Vec::new();
         for e in &self.entries {
-            out.push(FfonElement::Str(format!("{}{}", e.prompt, e.input)));
+            out.push(FfonElement::Str(format!(
+                "{}{}",
+                escape::escape(&e.prompt),
+                escape::escape(&e.input)
+            )));
             for line in entry_lines(&e.input, &e.output) {
-                out.push(FfonElement::Str(line.to_owned()));
+                out.push(FfonElement::Str(escape::escape(line)));
             }
         }
         // Directly above the input slot, where the output of a command would
         // be: the last thing that happened is the last thing read out.
         if let Some(msg) = &self.spawn_error {
-            out.push(FfonElement::Str(msg.clone()));
+            out.push(FfonElement::Str(escape::escape(msg)));
         }
         self.load_command_history();
-        let key = format!("{}<input>{}</input>", live_prompt, self.pending_input);
+        let key = format!(
+            "{}<input>{}</input>",
+            escape::escape(&live_prompt),
+            escape::escape(&self.pending_input)
+        );
         let mut slot = FfonElement::new_obj(key);
         if let Some(obj) = slot.as_obj_mut() {
             // Reversed: newest history entry on top. All entries, no dedup.
             // Each is a `<button>` so Enter on it fills the slot's <input>.
             for cmd in self.command_history.iter().rev() {
+                let cmd = escape::escape(cmd);
                 obj.children
                     .push(FfonElement::Str(format!("<button>{cmd}</button>{cmd}")));
             }
         }
         out.push(slot);
         out
+    }
+
+    /// The line a `commit_edit` on the live slot means.
+    ///
+    /// Typed text arrives plain and goes to the shell untouched, whatever it holds:
+    /// `echo \<b\>` is a real command. Enter on a slot already filled arrives as the
+    /// row's raw `<input>`, escaped, and means the plain text behind it.
+    fn submitted_line(&self, new: &str) -> String {
+        if escape::reads_back_as(new, &self.pending_input) {
+            self.pending_input.clone()
+        } else {
+            new.to_owned()
+        }
     }
 
     fn ensure_shell(&mut self) {
@@ -924,6 +947,7 @@ impl Plugin for TerminalProvider {
         if !old.is_empty() {
             return false;
         }
+        let new = self.submitted_line(new);
         self.ensure_shell();
         self.load_command_history();
         // Discard whatever the shell produced before this first command — its
@@ -942,10 +966,10 @@ impl Plugin for TerminalProvider {
         let Some(shell) = self.shell.as_mut() else {
             return false;
         };
-        if shell.write_line(new).is_err() {
+        if shell.write_line(&new).is_err() {
             return false;
         }
-        self.record_command(new);
+        self.record_command(&new);
         // Snapshot the prompt at submit time — past entries should display
         // the cwd they were run in, even after the user runs `cd` afterwards.
         let prompt = self.current_prompt();
@@ -954,7 +978,7 @@ impl Plugin for TerminalProvider {
         // working directory. Linux already covers this via `/proc/<pid>/cwd`
         // in `shell_cwd()`; the local update there is a harmless fallback.
         let base = PathBuf::from(self.shell_cwd());
-        if let Some(new_cwd) = parse_cd(new, &base) {
+        if let Some(new_cwd) = parse_cd(&new, &base) {
             self.cwd = Some(new_cwd);
         }
         // Prefer the parsed target: the child cannot have run the line yet, so
@@ -963,7 +987,7 @@ impl Plugin for TerminalProvider {
         self.sync_shell_path(true);
         self.entries.push(Entry {
             prompt,
-            input: new.to_owned(),
+            input: new,
             output: String::new(),
         });
         self.trim_scrollback();
@@ -973,8 +997,13 @@ impl Plugin for TerminalProvider {
         true
     }
 
+    /// The app hands over a history button's function name and a restored
+    /// `<input>`, both raw, and typed text from the insert palette. All three end
+    /// up in `pending_input` as plain text, which `fetch` escapes again.
     fn set_input_value(&mut self, value: &str) {
-        self.pending_input = value.to_owned();
+        if !escape::reads_back_as(value, &self.pending_input) {
+            self.pending_input = escape::unescape(value);
+        }
     }
 
     // ---- Commands --------------------------------------------------------
@@ -2860,6 +2889,346 @@ mod tests {
         p.set_input_value("from history");
         assert!(p.commit_edit("", "echo done"));
         assert!(p.pending_input.is_empty());
+    }
+}
+
+/// `plugin.json` asks for markup, so everything here that the plugin did not write
+/// is escaped on its way into a row. The text below is what that is for.
+#[cfg(test)]
+mod markup_tests {
+    use super::*;
+    use sicompass_sdk::{markup, tags};
+
+    const BOLD: &str = "<b>x</b>";
+    const STYLE: &str = "<style>li { color: red }</style>";
+    const INPUT: &str = "<input>y</input>";
+    const BACKSLASH: &str = r"ends in a backslash\";
+    const HOSTILE: [&str; 4] = [BOLD, STYLE, INPUT, BACKSLASH];
+
+    fn shell_view() -> TerminalProvider {
+        let mut p = TerminalProvider::new();
+        p.view = View::Shell;
+        p
+    }
+
+    /// What the row reads, with nothing in it the app would act on.
+    fn assert_literal(row: &str, original: &str) {
+        assert!(!markup::has_markup(row), "markup in {row:?}");
+        assert_eq!(markup::style_sheet(row), None, "a stylesheet: {row:?}");
+        assert!(!tags::has_input(row), "an input in {row:?}");
+        assert!(!tags::has_button(row), "a button in {row:?}");
+        assert_eq!(tags::strip_display(row), original);
+    }
+
+    fn str_rows(elems: &[FfonElement]) -> Vec<String> {
+        elems
+            .iter()
+            .filter_map(|e| e.as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// Unescaped, the app would act on these, which is what the tests below rule out.
+    #[test]
+    fn this_text_is_live_when_nothing_escapes_it() {
+        assert!(markup::has_markup(BOLD));
+        assert!(markup::style_sheet(STYLE).is_some());
+        assert!(tags::has_input(INPUT));
+    }
+
+    #[test]
+    fn the_manifest_asks_for_markup() {
+        assert!(include_str!("../plugin.json").contains(r#""markup": true"#));
+    }
+
+    #[test]
+    fn program_output_is_shown_literally() {
+        let mut p = shell_view();
+        p.entries.push(Entry {
+            prompt: "user@host:~$ ".to_owned(),
+            input: "cat page".to_owned(),
+            output: format!("{}\nnext prompt", HOSTILE.join("\n")),
+        });
+        let rows = str_rows(&p.fetch());
+        assert_eq!(rows.len(), 1 + HOSTILE.len(), "{rows:?}");
+        for (row, original) in rows[1..].iter().zip(HOSTILE) {
+            assert_literal(row, original);
+        }
+    }
+
+    #[test]
+    fn a_past_command_and_its_prompt_are_shown_literally() {
+        for command in HOSTILE {
+            let mut p = shell_view();
+            p.entries.push(Entry {
+                prompt: "user@host:~/<b>$ ".to_owned(),
+                input: command.to_owned(),
+                output: String::new(),
+            });
+            let rows = str_rows(&p.fetch());
+            assert_literal(&rows[0], &format!("user@host:~/<b>$ {command}"));
+        }
+    }
+
+    #[test]
+    fn the_echoed_command_is_still_recognised_with_brackets_in_it() {
+        let mut p = shell_view();
+        p.entries.push(Entry {
+            prompt: String::new(),
+            input: BOLD.to_owned(),
+            output: format!("{BOLD}\nx\nprompt"),
+        });
+        let rows = str_rows(&p.fetch());
+        assert_eq!(rows.len(), 2, "the echo is dropped: {rows:?}");
+        assert_literal(&rows[1], "x");
+    }
+
+    #[test]
+    fn a_flushed_interactive_session_is_shown_literally() {
+        let mut p = TerminalProvider::new();
+        p.entries.push(Entry {
+            prompt: String::new(),
+            input: BOLD.to_owned(),
+            output: String::new(),
+        });
+        p.enter_dashboard();
+        p.emulator.as_mut().unwrap().feed(INPUT.as_bytes());
+        p.leave_dashboard();
+        p.view = View::Shell;
+        let rows = str_rows(&p.fetch());
+        assert_literal(&rows[1], "[<b>x</b> — session output]");
+        assert_literal(&rows[2], INPUT);
+    }
+
+    #[test]
+    fn a_failure_to_start_is_shown_literally() {
+        let mut p = shell_view();
+        p.spawn_error = Some(format!("(failed to start `{BOLD}` in {INPUT}: no)"));
+        let rows = str_rows(&p.fetch());
+        assert_literal(
+            &rows[0],
+            &format!("(failed to start `{BOLD}` in {INPUT}: no)"),
+        );
+    }
+
+    /// Names a folder can really have (no `/`), walked into the way the app does:
+    /// through `strip_display`. The path that comes out has no backslash added.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_is_listed_literally_and_entered_by_its_real_name() {
+        for name in [
+            "<b>x",
+            "<style>li { color: red }",
+            "<input>y",
+            r"\<b>",
+            r"mid\dle",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let real = dir.path().join(name);
+            std::fs::create_dir(&real).unwrap();
+
+            let mut p = TerminalProvider::new();
+            p.browse_path = dir.path().to_path_buf();
+            let elems = p.fetch();
+            let key = &elems[0].as_obj().unwrap().key;
+            assert!(!markup::has_markup(key), "{key:?}");
+            assert!(!tags::has_input(key), "{key:?}");
+            let segment = tags::strip_display(key);
+            assert_eq!(segment, name);
+
+            p.push_path(&segment);
+            assert_eq!(p.browse_path, real);
+        }
+    }
+
+    /// Listed right, entered wrong, with or without markup: `push_path` trims a
+    /// trailing backslash on every platform, so on Unix a folder really named `back\`
+    /// is walked into as `back`. Trimming only on Windows would fix it.
+    #[cfg(unix)]
+    #[test]
+    fn known_limit_a_folder_ending_in_a_backslash_loses_it_on_the_way_in() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(BACKSLASH)).unwrap();
+        let mut p = TerminalProvider::new();
+        p.browse_path = dir.path().to_path_buf();
+        let elems = p.fetch();
+        let segment = tags::strip_display(&elems[0].as_obj().unwrap().key);
+        assert_eq!(segment, BACKSLASH);
+        p.push_path(&segment);
+        assert_eq!(
+            p.browse_path,
+            dir.path().join(BACKSLASH.trim_end_matches('\\'))
+        );
+    }
+
+    #[test]
+    fn the_prompt_of_the_live_slot_is_escaped_and_its_input_stays_real() {
+        let mut p = shell_view();
+        p.cwd = Some(PathBuf::from("/tmp/<b>x</b>"));
+        let elems = p.fetch();
+        let key = &elems.last().unwrap().as_obj().unwrap().key;
+        assert!(!markup::has_markup(key), "{key:?}");
+        assert!(tags::has_input(key), "{key:?}");
+        assert!(key.ends_with("<input></input>"), "{key:?}");
+        assert!(
+            tags::strip_display(key).contains("/tmp/<b>x</b>"),
+            "{key:?}"
+        );
+    }
+
+    #[test]
+    fn a_prefilled_slot_reads_back_as_what_was_prefilled() {
+        for value in [BOLD, STYLE, INPUT] {
+            let mut p = shell_view();
+            p.set_input_value(value);
+            assert_eq!(p.pending_input, value);
+            let elems = p.fetch();
+            let key = &elems.last().unwrap().as_obj().unwrap().key;
+            assert!(!markup::has_markup(key), "{key:?}");
+            assert!(tags::has_input(key), "{key:?}");
+            let raw = tags::extract_input(key).unwrap();
+            assert_eq!(escape::unescape(&raw), value);
+        }
+    }
+
+    fn history_rows(commands: &[&str]) -> Vec<String> {
+        let mut p = shell_view();
+        p.command_history = commands.iter().map(|c| (*c).to_owned()).collect();
+        p.command_history_loaded = true;
+        let elems = p.fetch();
+        let slot = elems.last().unwrap().as_obj().unwrap();
+        str_rows(&slot.children)
+    }
+
+    #[test]
+    fn a_recalled_command_is_a_button_and_holds_no_markup() {
+        for command in [BOLD, STYLE] {
+            let rows = history_rows(&[command]);
+            let row = &rows[0];
+            assert!(!markup::has_markup(row), "{row:?}");
+            assert!(tags::has_button(row), "{row:?}");
+            assert_eq!(tags::strip_display(row), command);
+            let name = tags::extract_button_function_name(row).unwrap();
+            assert_eq!(escape::unescape(&name), command);
+        }
+    }
+
+    /// It reads as the command it is, and stays inert.
+    #[test]
+    fn a_recalled_command_holding_an_input_tag_displays_with_it() {
+        let rows = history_rows(&[INPUT]);
+        let row = &rows[0];
+        assert!(!markup::has_markup(row), "{row:?}");
+        assert!(tags::has_button(row), "{row:?}");
+        assert_eq!(tags::strip_display(row), INPUT);
+        let name = tags::extract_button_function_name(row).unwrap();
+        assert_eq!(escape::unescape(&name), INPUT);
+    }
+
+    /// Enter on it fills the slot, like any other recalled command.
+    #[test]
+    fn a_recalled_command_ending_in_a_backslash_is_a_button() {
+        let rows = history_rows(&[BACKSLASH]);
+        let row = &rows[0];
+        assert!(!markup::has_markup(row), "{row:?}");
+        assert!(tags::has_button(row), "{row:?}");
+        assert_eq!(tags::strip_display(row), BACKSLASH);
+        assert_eq!(
+            tags::extract_button_function_name(row).as_deref(),
+            Some(BACKSLASH)
+        );
+    }
+
+    #[test]
+    fn a_slot_holding_a_trailing_backslash_is_an_input() {
+        let mut p = shell_view();
+        p.set_input_value(BACKSLASH);
+        let elems = p.fetch();
+        let key = &elems.last().unwrap().as_obj().unwrap().key;
+        assert!(!markup::has_markup(key), "{key:?}");
+        assert!(tags::has_input(key), "{key:?}");
+        assert_eq!(tags::extract_input(key).as_deref(), Some(BACKSLASH));
+    }
+
+    /// What a history button hands the slot, and what Enter on the slot then hands
+    /// `commit_edit`: the row's raw value, once escaped after a fetch, twice right
+    /// after the app filled it. Insert mode then Enter gives what `strip_display`
+    /// makes of that. None of them may reach the shell with a backslash.
+    #[test]
+    fn a_recalled_command_comes_back_with_its_original_bytes() {
+        for command in [BOLD, STYLE, INPUT, BACKSLASH, r"echo \<b\>", "a < b > c"] {
+            let mut p = shell_view();
+            p.set_input_value(&escape::escape(command));
+            assert_eq!(p.pending_input, command);
+            for raw in [
+                escape::escape(command),
+                escape::escape(&escape::escape(command)),
+                command.to_owned(),
+            ] {
+                assert_eq!(p.submitted_line(&raw), command, "from {raw:?}");
+            }
+            // Cancelling an edit restores the raw value of the row.
+            p.set_input_value(&escape::escape(&escape::escape(command)));
+            assert_eq!(p.pending_input, command);
+            p.set_input_value(&escape::escape(command));
+            assert_eq!(p.pending_input, command);
+        }
+    }
+
+    /// A shell line can really hold these. Typed, it goes to the shell as typed.
+    #[test]
+    fn a_typed_command_is_never_unescaped() {
+        let p = shell_view();
+        assert_eq!(p.submitted_line(r"echo \<b\>"), r"echo \<b\>");
+        assert_eq!(p.submitted_line(r"printf 'a\n'"), r"printf 'a\n'");
+    }
+
+    /// Through a real shell: the bytes run, the history and the output all match.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_command_runs_and_is_remembered_with_its_original_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = dir.path().join("history");
+        let mut p = TerminalProvider::new();
+        p.command_history_path = Some(history.clone());
+        p.on_setting_change("shellProgram", "/bin/sh");
+        p.browse_path = dir.path().to_path_buf();
+        p.enter_shell();
+        if p.shell.is_none() {
+            return; // CI sandbox: no PTY.
+        }
+
+        for (i, text) in HOSTILE.into_iter().enumerate() {
+            let command = format!("printf '%s\\n' '{text}'");
+            // Typed the first two times, Enter on a filled slot after that.
+            let sent = if i < 2 {
+                command.clone()
+            } else {
+                p.set_input_value(&escape::escape(&command));
+                escape::escape(&command)
+            };
+            assert!(p.commit_edit("", &sent));
+            assert_eq!(p.entries.last().unwrap().input, command);
+            assert_eq!(p.command_history.last().unwrap(), &command);
+            assert!(p.pending_input.is_empty());
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut shown = false;
+            while !shown && std::time::Instant::now() < deadline {
+                p.tick();
+                shown = str_rows(&p.fetch())
+                    .iter()
+                    .any(|row| !markup::has_markup(row) && tags::strip_display(row) == text);
+                std::thread::yield_now();
+            }
+            assert!(shown, "{text:?} was not shown: {:?}", str_rows(&p.fetch()));
+        }
+
+        let saved = std::fs::read_to_string(&history).unwrap();
+        let expected: Vec<String> = HOSTILE
+            .iter()
+            .map(|text| format!("printf '%s\\n' '{text}'"))
+            .collect();
+        assert_eq!(saved.lines().collect::<Vec<_>>(), expected);
     }
 }
 
