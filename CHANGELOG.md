@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+- Output, commands and folder names are shown exactly as written, never read as markup, and a command runs with its own bytes.
+- Needs sicompass 0.2.4.
+- Intel macs are not built any more.
+
 ## 0.3.1
 
 - The shell itself never opens the dashboard. Only a program running in the
