@@ -338,6 +338,88 @@ fn is_program(dir: &std::path::Path, program: &str) -> bool {
     }
 }
 
+/// The folders programs are run from by name: every `PATH` entry, then
+/// `~/.local/bin`, which [`resolve_program`] falls back to as well.
+pub fn program_dirs() -> Vec<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&path)
+        .filter(|d| !d.as_os_str().is_empty())
+        .collect();
+    if let Some(local) = crate::sys::home_dir().map(|h| h.join(".local").join("bin")) {
+        dirs.push(local);
+    }
+    dirs
+}
+
+/// Every program in `dirs`, by the name typed to run it, sorted and each once:
+/// the executable files on Unix, on Windows the files with a `PATHEXT`
+/// extension, without it.
+pub fn list_programs_in(dirs: &[PathBuf]) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Some(name) = program_name_of(&entry.path(), &name) {
+                names.insert(name);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // `GIT.EXE` and `git.exe` are one program on Windows.
+        let mut seen = std::collections::HashSet::new();
+        names.retain(|n| seen.insert(n.to_lowercase()));
+    }
+    names.into_iter().collect()
+}
+
+/// The name a file in a program folder is run by, if it is a program.
+#[cfg(unix)]
+fn program_name_of(path: &std::path::Path, name: &str) -> Option<String> {
+    is_executable(path).then(|| name.to_owned())
+}
+
+#[cfg(not(unix))]
+fn program_name_of(path: &std::path::Path, name: &str) -> Option<String> {
+    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+    let (stem, ext) = name.rsplit_once('.')?;
+    let is_program = exts
+        .split(';')
+        .any(|e| e.trim_start_matches('.').eq_ignore_ascii_case(ext));
+    (is_program && !stem.is_empty() && path.is_file()).then(|| stem.to_owned())
+}
+
+/// [`list_programs_in`], kept until one of the folders changes. Asked each time
+/// the user opens second command mode, so the folders are only looked at, and
+/// read again when one of them was modified (a program installed or removed).
+#[derive(Default)]
+pub struct ProgramCache {
+    stamps: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+    names: Option<Vec<String>>,
+}
+
+impl ProgramCache {
+    pub fn programs(&mut self, dirs: &[PathBuf]) -> &[String] {
+        let stamps: Vec<_> = dirs
+            .iter()
+            .map(|d| {
+                let modified = std::fs::metadata(d).and_then(|m| m.modified()).ok();
+                (d.clone(), modified)
+            })
+            .collect();
+        if self.names.is_none() || stamps != self.stamps {
+            self.names = Some(list_programs_in(dirs));
+            self.stamps = stamps;
+        }
+        self.names.as_deref().unwrap_or_default()
+    }
+}
+
 #[cfg(unix)]
 fn is_executable(p: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -503,6 +585,71 @@ fn interactive_flag(program: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    fn make_program(dir: &std::path::Path, name: &str, exec: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, "#!/bin/sh\n").unwrap();
+        let mode = if exec { 0o755 } else { 0o644 };
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn programs_are_the_executables_of_every_folder_sorted_and_once() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        make_program(a.path(), "zed", true);
+        make_program(a.path(), "git", true);
+        make_program(a.path(), "notes.txt", false);
+        make_program(b.path(), "git", true);
+        std::fs::create_dir(b.path().join("folder")).unwrap();
+        let dirs = vec![
+            a.path().to_path_buf(),
+            b.path().to_path_buf(),
+            b.path().join("absent"),
+        ];
+        assert_eq!(list_programs_in(&dirs), ["git", "zed"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_program_cache_reads_a_folder_again_once_it_changed() {
+        let a = tempfile::tempdir().unwrap();
+        make_program(a.path(), "git", true);
+        let dirs = vec![a.path().to_path_buf()];
+        let mut cache = ProgramCache::default();
+        assert_eq!(cache.programs(&dirs), ["git"]);
+        make_program(a.path(), "grep", true);
+        // A folder's modification time can be as coarse as a second.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::open(a.path())
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(cache.programs(&dirs), ["git", "grep"]);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn programs_on_windows_are_named_without_their_extension() {
+        let a = tempfile::tempdir().unwrap();
+        for f in ["git.exe", "GIT.EXE", "build.cmd", "readme.txt"] {
+            std::fs::write(a.path().join(f), "").unwrap();
+        }
+        let names = list_programs_in(&[a.path().to_path_buf()]);
+        assert!(names.iter().any(|n| n.eq_ignore_ascii_case("git")));
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.eq_ignore_ascii_case("git"))
+                .count(),
+            1
+        );
+        assert!(names.contains(&"build".to_owned()));
+        assert!(!names.iter().any(|n| n.starts_with("readme")));
+    }
     use super::*;
     use std::time::{Duration, Instant};
 

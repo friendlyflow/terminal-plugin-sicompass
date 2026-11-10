@@ -16,7 +16,8 @@ GitHub releases, one build per platform. The plugin platform is described in
 
 - `plugin.json` is the manifest. Its `name` is `terminal` (the app gives
   `:` and the live input slot special treatment by that name, so it must not
-  change) and its `displayName` `terminal` is the settings section
+  change; the second `:`, where a line is written, comes from the shell view
+  listing `COMPOSE_COMMAND` and answering `completions`) and its `displayName` `terminal` is the settings section
   (`shellProgram`, `commandHistorySize`, `scrollbackSize`,
   `autoEnterDashboard`, the keys the built-in had). It asks for `storage` (the
   recall history), `"filesystem": ["/"]` and the shells by name (`$SHELL` is
@@ -41,7 +42,8 @@ GitHub releases, one build per platform. The plugin platform is described in
 - **The prompt** needs the user, the host and the home folder: `src/sys.rs`
   reads the environment, and the host name from `gethostname`.
 - **The recall history** is `history` in the plugin's storage folder
-  (`sicompass_sdk::plugin::storage_dir`). No test may reach it:
+  (`sicompass_sdk::plugin::storage_dir`), offered as the lines of second
+  command mode after the programs on `PATH` (`shell::ProgramCache`). No test may reach it:
   `TEST_NO_HISTORY` defaults on under `cfg(test)`.
 - **The interactive dashboard** is the SDK's `DashboardFrame` from the vte
   emulator, handed to the app with `.into()` (the SDK converts, and keys the

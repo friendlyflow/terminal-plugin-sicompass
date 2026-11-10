@@ -42,7 +42,9 @@ use std::path::{Path, PathBuf};
 use emulator::{Emulator, encode_dashboard_key};
 use interactive_detect::{InteractiveDetector, InteractiveEvent};
 use shell::{Shell, ShellConfig, default_program};
-use sicompass_sdk::plugin::{Descriptor, FfonElement, Frame, Key, Plugin, PollResult};
+use sicompass_sdk::plugin::{
+    COMPOSE_COMMAND, Completions, Descriptor, FfonElement, Frame, Key, ListItem, Plugin, PollResult,
+};
 use sicompass_sdk::{DashboardFrame, DashboardKey, DashboardRequest};
 
 // ---------------------------------------------------------------------------
@@ -88,6 +90,11 @@ pub const CMD_SHELL: &str = "shell";
 /// Command id: swap from the shell back to the folder listing. Idempotent, so
 /// the app can fire it without first asking which view is active.
 pub const CMD_BROWSE: &str = "browse";
+
+/// How many of the commands run before second command mode offers, newest
+/// first and each once. Enough to reach back a long way, few enough that the
+/// list crosses to the app at once.
+const COMPOSE_HISTORY_ROWS: usize = 5_000;
 
 /// Which list the provider is currently serving from `fetch()`.
 ///
@@ -189,9 +196,14 @@ pub struct TerminalProvider {
     /// reaches `command_history_size`, bounding the file at ~2× the cap.
     appends_since_compact: usize,
     /// Value to pre-fill into the live `<input>` slot on the next `fetch()`.
-    /// Set via `set_input_value()` when the user picks a history child;
-    /// cleared on a successful `commit_edit()`.
+    /// Set via `set_input_value()` when the user wrote a line in second command
+    /// mode; cleared on a successful `commit_edit()`.
     pending_input: String,
+    /// The programs second command mode offers, read from the program folders
+    /// again only when one changed.
+    programs: shell::ProgramCache,
+    /// The folders programs are looked for in, instead of `PATH`. Tests set it.
+    program_dirs: Option<Vec<PathBuf>>,
 
     /// `true` when `terminal.autoEnterDashboard` is enabled (default true).
     /// Gates the alt-screen detector entirely — when off, no auto enter/leave.
@@ -238,6 +250,8 @@ impl TerminalProvider {
             command_history_path: None,
             appends_since_compact: 0,
             pending_input: String::new(),
+            programs: shell::ProgramCache::default(),
+            program_dirs: None,
             auto_enter_dashboard: true,
             auto_entered_dashboard: false,
             pending_dashboard_request: None,
@@ -550,11 +564,10 @@ impl TerminalProvider {
     fn fetch_scrollback(&mut self) -> Vec<FfonElement> {
         // Flat layout: one Str per prompt-line (`{prompt}{cmd}`) and one Str
         // per output-line, in chronological order. The trailing element is the
-        // live input slot — a `+i` Obj: an `<input>` prefixed with the *live*
+        // live input slot, a `-i` Str: an `<input>` prefixed with the *live*
         // prompt (recomputed every fetch so it reflects the shell's current
-        // cwd after `cd`). Its children are the recall history as `<button>`
-        // Strs, newest first, so the user can browse and reuse past commands
-        // by navigating into the slot — Enter on a button fills the input.
+        // cwd after `cd`). Past commands are offered by second command mode
+        // (`completions`), not under the slot.
         let live_prompt = self.current_prompt();
         let mut out: Vec<FfonElement> = Vec::new();
         for e in &self.entries {
@@ -572,24 +585,46 @@ impl TerminalProvider {
         if let Some(msg) = &self.spawn_error {
             out.push(FfonElement::Str(escape::escape(msg)));
         }
-        self.load_command_history();
-        let key = format!(
+        out.push(FfonElement::Str(format!(
             "{}<input>{}</input>",
             escape::escape(&live_prompt),
             escape::escape(&self.pending_input)
-        );
-        let mut slot = FfonElement::new_obj(key);
-        if let Some(obj) = slot.as_obj_mut() {
-            // Reversed: newest history entry on top. All entries, no dedup.
-            // Each is a `<button>` so Enter on it fills the slot's <input>.
-            for cmd in self.command_history.iter().rev() {
-                let cmd = escape::escape(cmd);
-                obj.children
-                    .push(FfonElement::Str(format!("<button>{cmd}</button>{cmd}")));
-            }
-        }
-        out.push(slot);
+        )));
         out
+    }
+
+    /// What second command mode offers in the shell: the programs, then the
+    /// commands run before, newest first and each once. Nothing in the folder
+    /// listing, which has no prompt.
+    fn compose_completions(&mut self) -> Completions {
+        if self.view != View::Shell {
+            return Completions::default();
+        }
+        self.load_command_history();
+        let item = |s: &str| ListItem {
+            label: s.to_owned(),
+            data: s.to_owned(),
+        };
+        let dirs = self
+            .program_dirs
+            .clone()
+            .unwrap_or_else(shell::program_dirs);
+        let words = self
+            .programs
+            .programs(&dirs)
+            .iter()
+            .map(|n| item(n))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let lines = self
+            .command_history
+            .iter()
+            .rev()
+            .filter(|c| seen.insert(c.as_str()))
+            .take(COMPOSE_HISTORY_ROWS)
+            .map(|c| item(c))
+            .collect();
+        Completions { words, lines }
     }
 
     /// The line a `commit_edit` on the live slot means.
@@ -997,9 +1032,9 @@ impl Plugin for TerminalProvider {
         true
     }
 
-    /// The app hands over a history button's function name and a restored
-    /// `<input>`, both raw, and typed text from the insert palette. All three end
-    /// up in `pending_input` as plain text, which `fetch` escapes again.
+    /// The app hands over the line written in second command mode and a restored
+    /// `<input>`, both raw as the row holds them. Both end up in `pending_input`
+    /// as plain text, which `fetch` escapes again.
     fn set_input_value(&mut self, value: &str) {
         if !escape::reads_back_as(value, &self.pending_input) {
             self.pending_input = escape::unescape(value);
@@ -1010,7 +1045,8 @@ impl Plugin for TerminalProvider {
     //
     // For this provider the app routes `:` straight to `handle_command("shell")`
     // rather than opening the command palette, so these are normally invoked
-    // without the list ever being drawn. They are still implemented properly:
+    // without the list ever being drawn. In the shell, `:` opens second command
+    // mode instead (`COMPOSE_COMMAND`, answered by `completions`). They are still implemented properly:
     // the plugin channel and the tests reach the terminal through the
     // generic command path, and `commands()` is what tells the app which of the
     // two transitions is currently available — that is how the app decides
@@ -1019,14 +1055,20 @@ impl Plugin for TerminalProvider {
     fn commands(&self) -> Vec<String> {
         match self.view {
             View::Browse => vec![CMD_SHELL.to_owned()],
-            View::Shell => vec![CMD_BROWSE.to_owned()],
+            // `compose`: `:` in the shell writes a line for the prompt.
+            View::Shell => vec![CMD_BROWSE.to_owned(), COMPOSE_COMMAND.to_owned()],
         }
+    }
+
+    fn completions(&mut self) -> Completions {
+        self.compose_completions()
     }
 
     fn command_label(&self, cmd: &str) -> String {
         match cmd {
             CMD_SHELL => localize::t("terminal-command-shell"),
             CMD_BROWSE => localize::t("terminal-command-browse"),
+            COMPOSE_COMMAND => localize::t("terminal-command-compose"),
             other => other.to_owned(),
         }
     }
@@ -1557,53 +1599,71 @@ mod tests {
         p.command_history_path = Some(dir.path().join("absent"));
         let elems = p.fetch();
         assert_eq!(elems.len(), 1);
-        // The trailing element is the `+i` live input slot: an Obj whose key
-        // wraps an empty <input>, prefixed with the synthesized prompt.
-        let key = &elems[0].as_obj().unwrap().key;
+        // The trailing element is the live input slot: a `-i` Str wrapping an
+        // empty <input>, prefixed with the synthesized prompt.
+        let key = elems[0]
+            .as_str()
+            .expect("the slot is a Str, with nothing under it");
         assert!(!key.contains("<radio>"), "got {key:?}");
         assert!(key.ends_with("<input></input>"), "got {key:?}");
     }
 
     #[test]
-    fn fetch_live_input_children_are_reversed_history_buttons() {
+    fn the_lines_of_second_command_mode_are_the_history_newest_first() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history");
         std::fs::write(&path, "a\nb\nc\n").unwrap();
         let mut p = shell_view();
         p.command_history_path = Some(path);
-        let elems = p.fetch();
-        let slot = elems.last().unwrap().as_obj().unwrap();
-        let kids: Vec<&str> = slot.children.iter().filter_map(|e| e.as_str()).collect();
-        // Newest first, each a `<button>` Str.
+        p.program_dirs = Some(Vec::new());
+        let c = p.compose_completions();
+        let lines: Vec<&str> = c.lines.iter().map(|l| l.data.as_str()).collect();
+        assert_eq!(lines, ["c", "b", "a"]);
+    }
+
+    #[test]
+    fn the_lines_of_second_command_mode_are_each_command_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        std::fs::write(&path, "ls\ncd\nls\n").unwrap();
+        let mut p = shell_view();
+        p.command_history_path = Some(path);
+        p.program_dirs = Some(Vec::new());
+        let c = p.compose_completions();
+        let lines: Vec<&str> = c.lines.iter().map(|l| l.data.as_str()).collect();
+        assert_eq!(lines, ["ls", "cd"], "the newest of each, newest first");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_words_of_second_command_mode_are_the_programs() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let prog = bin.join("frobnicate");
+        std::fs::write(&prog, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut p = shell_view();
+        p.command_history_path = Some(dir.path().join("absent"));
+        p.program_dirs = Some(vec![bin]);
+        let c = p.compose_completions();
         assert_eq!(
-            kids,
-            vec![
-                "<button>c</button>c",
-                "<button>b</button>b",
-                "<button>a</button>a",
-            ]
+            c.words,
+            [ListItem {
+                label: "frobnicate".to_owned(),
+                data: "frobnicate".to_owned(),
+            }]
         );
     }
 
     #[test]
-    fn fetch_live_input_keeps_duplicate_history_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("history");
-        std::fs::write(&path, "ls\nls\ncd\n").unwrap();
-        let mut p = shell_view();
-        p.command_history_path = Some(path);
-        let elems = p.fetch();
-        let slot = elems.last().unwrap().as_obj().unwrap();
-        let kids: Vec<&str> = slot.children.iter().filter_map(|e| e.as_str()).collect();
-        // No de-duplication — raw chronological history, reversed.
-        assert_eq!(
-            kids,
-            vec![
-                "<button>cd</button>cd",
-                "<button>ls</button>ls",
-                "<button>ls</button>ls",
-            ]
-        );
+    fn second_command_mode_offers_nothing_in_the_folder_listing() {
+        let mut p = TerminalProvider::new();
+        p.program_dirs = Some(Vec::new());
+        p.command_history = vec!["ls".to_owned()];
+        p.command_history_loaded = true;
+        assert_eq!(p.compose_completions(), Completions::default());
     }
 
     #[test]
@@ -1613,7 +1673,7 @@ mod tests {
         p.command_history_path = Some(dir.path().join("absent"));
         p.set_input_value("git status");
         let elems = p.fetch();
-        let key = &elems.last().unwrap().as_obj().unwrap().key;
+        let key = elems.last().unwrap().as_str().unwrap();
         assert!(key.contains("<input>git status</input>"), "got {key:?}");
     }
 
@@ -1779,7 +1839,11 @@ mod tests {
         let mut p = TerminalProvider::new();
         assert_eq!(p.commands(), vec![CMD_SHELL.to_owned()]);
         p.view = View::Shell;
-        assert_eq!(p.commands(), vec![CMD_BROWSE.to_owned()]);
+        assert_eq!(
+            p.commands(),
+            vec![CMD_BROWSE.to_owned(), COMPOSE_COMMAND.to_owned()],
+            "and in the shell, `:` writes a line"
+        );
     }
 
     #[test]
@@ -1878,8 +1942,18 @@ mod tests {
     /// The `Str` rows of the shell view — everything above the `+i` input slot.
     /// Only the Unix tests read them.
     #[cfg(unix)]
+    /// The shell view's rows above the prompt, the last row.
     fn scrollback_rows(p: &mut TerminalProvider) -> Vec<String> {
-        p.fetch()
+        let mut elems = p.fetch();
+        assert!(
+            elems
+                .last()
+                .and_then(|e| e.as_str())
+                .is_some_and(sicompass_sdk::tags::has_input),
+            "the shell view ends in its prompt: {elems:?}"
+        );
+        elems.pop();
+        elems
             .iter()
             .filter_map(|e| match e {
                 FfonElement::Str(s) => Some(s.clone()),
@@ -2345,14 +2419,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fetch_uses_synthesized_prompt_for_input_slot() {
-        // No shell spawned, no entries — the trailing element is the `+i`
-        // live input slot, an Obj whose key embeds the synthesized prompt.
+        // No shell spawned, no entries — the trailing element is the `-i`
+        // live input slot, a Str that embeds the synthesized prompt.
         let dir = tempfile::tempdir().unwrap();
         let mut p = shell_view();
         p.command_history_path = Some(dir.path().join("absent"));
         let elems = p.fetch();
         assert_eq!(elems.len(), 1);
-        let key = &elems[0].as_obj().unwrap().key;
+        let key = elems[0].as_str().unwrap();
         assert!(key.ends_with("$ <input></input>"), "got {key:?}");
         assert!(key.contains('@'), "expected user@host segment; got {key:?}");
     }
@@ -2366,7 +2440,7 @@ mod tests {
         p.command_history_path = Some(dir.path().join("absent"));
         let elems = p.fetch();
         assert_eq!(elems.len(), 1);
-        let key = &elems[0].as_obj().unwrap().key;
+        let key = elems[0].as_str().unwrap();
         assert!(key.ends_with("> <input></input>"), "got {key:?}");
         assert!(
             !key.contains('@'),
@@ -2386,18 +2460,12 @@ mod tests {
             output: "ls\nfile1\nfile2\n".to_owned(),
         });
         let elems = p.fetch();
-        // Past prompt + cmd, two output lines, then the `+i` input slot Obj.
+        // Past prompt + cmd, two output lines, then the `-i` input slot.
         assert_eq!(elems.len(), 4);
         assert_eq!(elems[0].as_str(), Some("user@host:/tmp$ ls"));
         assert_eq!(elems[1].as_str(), Some("file1"));
         assert_eq!(elems[2].as_str(), Some("file2"));
-        assert!(
-            elems[3]
-                .as_obj()
-                .unwrap()
-                .key
-                .ends_with("$ <input></input>")
-        );
+        assert!(elems[3].as_str().unwrap().ends_with("$ <input></input>"));
     }
 
     #[cfg(unix)]
@@ -2856,9 +2924,9 @@ mod tests {
         assert!(
             elems
                 .last()
-                .and_then(|e| e.as_obj())
-                .is_some_and(|o| o.key.ends_with("<input></input>")),
-            "last element should be the +i input slot; got {:?}",
+                .and_then(|e| e.as_str())
+                .is_some_and(|k| k.ends_with("<input></input>")),
+            "last element should be the -i input slot; got {:?}",
             elems.last()
         );
         assert!(
@@ -2866,15 +2934,15 @@ mod tests {
                 .iter()
                 .any(|e| e.as_str().is_some_and(|s| s.contains("terminal-it-test")))
         );
-        // The committed command landed in the recall history → slot children
-        // are `<button>` Strs.
+        // The committed command landed in the recall history, which second
+        // command mode offers.
+        p.program_dirs = Some(Vec::new());
         assert!(
-            elems.last().and_then(|e| e.as_obj()).is_some_and(|o| o
-                .children
+            p.compose_completions()
+                .lines
                 .iter()
-                .any(|c| c.as_str()
-                    == Some("<button>echo terminal-it-test</button>echo terminal-it-test"))),
-            "committed command should appear as a history button child"
+                .any(|l| l.data == "echo terminal-it-test"),
+            "committed command should be offered as a past line"
         );
     }
 
@@ -2920,9 +2988,13 @@ mod markup_tests {
         assert_eq!(tags::strip_display(row), original);
     }
 
+    /// The Str rows of a fetch, without the shell view's prompt, its last row.
     fn str_rows(elems: &[FfonElement]) -> Vec<String> {
-        elems
-            .iter()
+        let rows = match elems.last().and_then(|e| e.as_str()) {
+            Some(last) if tags::has_input(last) => &elems[..elems.len() - 1],
+            _ => elems,
+        };
+        rows.iter()
             .filter_map(|e| e.as_str().map(str::to_owned))
             .collect()
     }
@@ -3065,7 +3137,7 @@ mod markup_tests {
         let mut p = shell_view();
         p.cwd = Some(PathBuf::from("/tmp/<b>x</b>"));
         let elems = p.fetch();
-        let key = &elems.last().unwrap().as_obj().unwrap().key;
+        let key = elems.last().unwrap().as_str().unwrap();
         assert!(!markup::has_markup(key), "{key:?}");
         assert!(tags::has_input(key), "{key:?}");
         assert!(key.ends_with("<input></input>"), "{key:?}");
@@ -3082,7 +3154,7 @@ mod markup_tests {
             p.set_input_value(value);
             assert_eq!(p.pending_input, value);
             let elems = p.fetch();
-            let key = &elems.last().unwrap().as_obj().unwrap().key;
+            let key = elems.last().unwrap().as_str().unwrap();
             assert!(!markup::has_markup(key), "{key:?}");
             assert!(tags::has_input(key), "{key:?}");
             let raw = tags::extract_input(key).unwrap();
@@ -3090,52 +3162,21 @@ mod markup_tests {
         }
     }
 
-    fn history_rows(commands: &[&str]) -> Vec<String> {
-        let mut p = shell_view();
-        p.command_history = commands.iter().map(|c| (*c).to_owned()).collect();
-        p.command_history_loaded = true;
-        let elems = p.fetch();
-        let slot = elems.last().unwrap().as_obj().unwrap();
-        str_rows(&slot.children)
-    }
-
+    /// A past command is offered in second command mode as the bytes that ran,
+    /// whatever it holds: its row is a list row the app draws as it is, not a
+    /// row of the tree, and Tab writes `data` into the line as typed text.
     #[test]
-    fn a_recalled_command_is_a_button_and_holds_no_markup() {
-        for command in [BOLD, STYLE] {
-            let rows = history_rows(&[command]);
-            let row = &rows[0];
-            assert!(!markup::has_markup(row), "{row:?}");
-            assert!(tags::has_button(row), "{row:?}");
-            assert_eq!(tags::strip_display(row), command);
-            let name = tags::extract_button_function_name(row).unwrap();
-            assert_eq!(escape::unescape(&name), command);
+    fn a_past_command_is_offered_as_it_was_typed() {
+        for command in [BOLD, STYLE, INPUT, BACKSLASH, r"echo \<b\>", "a < b > c"] {
+            let mut p = shell_view();
+            p.command_history = vec![command.to_owned()];
+            p.command_history_loaded = true;
+            p.program_dirs = Some(Vec::new());
+            let lines = p.compose_completions().lines;
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].label, command);
+            assert_eq!(lines[0].data, command);
         }
-    }
-
-    /// It reads as the command it is, and stays inert.
-    #[test]
-    fn a_recalled_command_holding_an_input_tag_displays_with_it() {
-        let rows = history_rows(&[INPUT]);
-        let row = &rows[0];
-        assert!(!markup::has_markup(row), "{row:?}");
-        assert!(tags::has_button(row), "{row:?}");
-        assert_eq!(tags::strip_display(row), INPUT);
-        let name = tags::extract_button_function_name(row).unwrap();
-        assert_eq!(escape::unescape(&name), INPUT);
-    }
-
-    /// Enter on it fills the slot, like any other recalled command.
-    #[test]
-    fn a_recalled_command_ending_in_a_backslash_is_a_button() {
-        let rows = history_rows(&[BACKSLASH]);
-        let row = &rows[0];
-        assert!(!markup::has_markup(row), "{row:?}");
-        assert!(tags::has_button(row), "{row:?}");
-        assert_eq!(tags::strip_display(row), BACKSLASH);
-        assert_eq!(
-            tags::extract_button_function_name(row).as_deref(),
-            Some(BACKSLASH)
-        );
     }
 
     #[test]
@@ -3143,7 +3184,7 @@ mod markup_tests {
         let mut p = shell_view();
         p.set_input_value(BACKSLASH);
         let elems = p.fetch();
-        let key = &elems.last().unwrap().as_obj().unwrap().key;
+        let key = elems.last().unwrap().as_str().unwrap();
         assert!(!markup::has_markup(key), "{key:?}");
         assert!(tags::has_input(key), "{key:?}");
         assert_eq!(tags::extract_input(key).as_deref(), Some(BACKSLASH));
