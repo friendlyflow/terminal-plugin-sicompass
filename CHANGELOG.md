@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.3
+
+- A second colon in the shell writes a command: the programs you have first, then the commands you ran before. Tab completes the word you are typing, and Enter puts the command in the input line, where Enter runs it. The input line no longer has the history under it.
+- Needs sicompass 0.2.6.
+
 ## 0.3.2
 
 - Output, commands and folder names are shown exactly as written, never read as markup, and a command runs with its own bytes.

@@ -732,9 +732,9 @@ checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
 name = "sicompass-sdk"
-version = "0.9.14"
+version = "0.9.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe3b52b80287c856a9875656cc099999bfb4203a38604c0278d57f7539827aa5"
+checksum = "e6ffad6aabc712811e288a05b73776e883ac79fe0dd8957840e5ff3c0b46b021"
 dependencies = [
  "async-trait",
  "libc",
@@ -846,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-plugin"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "libc",
  "natord",

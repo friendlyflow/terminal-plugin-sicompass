@@ -3,7 +3,7 @@
 
 [package]
 name = "terminal-plugin"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Terminal for sicompass: a shell as a list, with full-screen programs in a dashboard, as a plugin"
@@ -19,7 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 # The plugin kit (`plugin`) and the FFON model, from crates.io.
-sicompass-sdk = { version = "0.9.12", default-features = false, features = ["plugin"] }
+sicompass-sdk = { version = "0.9.15", default-features = false, features = ["plugin"] }
 # The terminal emulator behind the interactive dashboard.
 vte = "0.15"
 # Natural sort for the folder listing, matching the file browser.
