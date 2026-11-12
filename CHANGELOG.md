@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.4
+
+- Ctrl+Left and Ctrl+Right move by word in the shell, and Ctrl+Backspace and Ctrl+Delete delete a word. Modified arrows, Home, End and the page keys reach the program the way xterm sends them.
+
 ## 0.3.3
 
 - A second colon in the shell writes a command: the programs you have first, then the commands you ran before. Tab completes the word you are typing, and Enter puts the command in the input line, where Enter runs it. The input line no longer has the history under it.
