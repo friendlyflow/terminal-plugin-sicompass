@@ -783,21 +783,45 @@ fn palette_256(idx: u8) -> u32 {
 /// output (e.g. `Unknown`, or unmodified printable chars that arrive
 /// separately via `dashboard_text`).
 pub fn encode_dashboard_key(key: &DashboardKey) -> Option<Vec<u8>> {
+    // xterm's modifier parameter: 1, plus 1 for Shift, 2 for Alt, 4 for Ctrl.
+    // A modified arrow, Home or End is `ESC [ 1 ; m X` (Ctrl+Left is
+    // `ESC [ 1 ; 5 D`, which readline and zsh move back a word on), a modified
+    // PgUp, PgDn, Insert or Delete `ESC [ n ; m ~`.
+    let m = 1 + u8::from(key.shift) + 2 * u8::from(key.alt) + 4 * u8::from(key.ctrl);
+    let cursor = |x: char| -> Option<Vec<u8>> {
+        Some(if m > 1 {
+            format!("\x1b[1;{m}{x}").into_bytes()
+        } else {
+            format!("\x1b[{x}").into_bytes()
+        })
+    };
+    let tilde = |n: u8| -> Option<Vec<u8>> {
+        Some(if m > 1 {
+            format!("\x1b[{n};{m}~").into_bytes()
+        } else {
+            format!("\x1b[{n}~").into_bytes()
+        })
+    };
     match key.keysym {
         DashboardKeysym::Enter => Some(b"\r".to_vec()),
+        // Ctrl+Backspace and Ctrl+Delete delete a word, as in every text field
+        // of the app: ESC DEL and ESC d are backward-kill-word and kill-word in
+        // readline, zsh and fish alike, which no xterm sequence is by default.
+        DashboardKeysym::Backspace if key.ctrl => Some(b"\x1b\x7F".to_vec()),
+        DashboardKeysym::Delete if key.ctrl => Some(b"\x1bd".to_vec()),
         DashboardKeysym::Backspace => Some(b"\x7F".to_vec()),
         DashboardKeysym::Tab => Some(b"\t".to_vec()),
         DashboardKeysym::Escape => Some(b"\x1b".to_vec()),
-        DashboardKeysym::Up => Some(b"\x1b[A".to_vec()),
-        DashboardKeysym::Down => Some(b"\x1b[B".to_vec()),
-        DashboardKeysym::Right => Some(b"\x1b[C".to_vec()),
-        DashboardKeysym::Left => Some(b"\x1b[D".to_vec()),
-        DashboardKeysym::Home => Some(b"\x1b[H".to_vec()),
-        DashboardKeysym::End => Some(b"\x1b[F".to_vec()),
-        DashboardKeysym::PageUp => Some(b"\x1b[5~".to_vec()),
-        DashboardKeysym::PageDown => Some(b"\x1b[6~".to_vec()),
-        DashboardKeysym::Insert => Some(b"\x1b[2~".to_vec()),
-        DashboardKeysym::Delete => Some(b"\x1b[3~".to_vec()),
+        DashboardKeysym::Up => cursor('A'),
+        DashboardKeysym::Down => cursor('B'),
+        DashboardKeysym::Right => cursor('C'),
+        DashboardKeysym::Left => cursor('D'),
+        DashboardKeysym::Home => cursor('H'),
+        DashboardKeysym::End => cursor('F'),
+        DashboardKeysym::PageUp => tilde(5),
+        DashboardKeysym::PageDown => tilde(6),
+        DashboardKeysym::Insert => tilde(2),
+        DashboardKeysym::Delete => tilde(3),
         DashboardKeysym::F(n) => Some(encode_function_key(n)),
         DashboardKeysym::Char(c) => {
             if key.ctrl {
@@ -1092,6 +1116,30 @@ mod tests {
     }
 
     // ---- key encoding -----------------------------------------------------
+
+    #[test]
+    fn encode_ctrl_word_and_line_keys_the_way_xterm_does() {
+        let k = |keysym, ctrl, shift| {
+            encode_dashboard_key(&DashboardKey {
+                keysym,
+                ctrl,
+                shift,
+                alt: false,
+            })
+            .unwrap()
+        };
+        assert_eq!(k(DashboardKeysym::Left, true, false), b"\x1b[1;5D");
+        assert_eq!(k(DashboardKeysym::Right, true, false), b"\x1b[1;5C");
+        assert_eq!(k(DashboardKeysym::Home, true, false), b"\x1b[1;5H");
+        assert_eq!(k(DashboardKeysym::End, true, false), b"\x1b[1;5F");
+        assert_eq!(k(DashboardKeysym::Left, true, true), b"\x1b[1;6D");
+        assert_eq!(k(DashboardKeysym::Up, false, true), b"\x1b[1;2A");
+        assert_eq!(k(DashboardKeysym::PageUp, true, false), b"\x1b[5;5~");
+        assert_eq!(k(DashboardKeysym::Backspace, true, false), b"\x1b\x7F");
+        assert_eq!(k(DashboardKeysym::Delete, true, false), b"\x1bd");
+        assert_eq!(k(DashboardKeysym::Delete, false, false), b"\x1b[3~");
+        assert_eq!(k(DashboardKeysym::Left, false, false), b"\x1b[D");
+    }
 
     #[test]
     fn encode_special_keys() {
