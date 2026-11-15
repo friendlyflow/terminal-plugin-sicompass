@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.5
+
+- The mouse reaches a full-screen program. htop, vim, mc and others that ask for the mouse get clicks, drags and the wheel at the cell under the pointer, the way xterm sends them. A program that asks for no mouse gets the wheel as arrow keys on the alternate screen, so less and man scroll. Needs sicompass 0.2.8 for the mouse, and works as before on an older one.
+
 ## 0.3.4
 
 - Ctrl+Left and Ctrl+Right move by word in the shell, and Ctrl+Backspace and Ctrl+Delete delete a word. Modified arrows, Home, End and the page keys reach the program the way xterm sends them.
