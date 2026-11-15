@@ -39,7 +39,7 @@ mod sys;
 
 use std::path::{Path, PathBuf};
 
-use emulator::{Emulator, encode_dashboard_key};
+use emulator::{Emulator, MouseTracking, encode_dashboard_key, encode_dashboard_mouse};
 use interactive_detect::{InteractiveDetector, InteractiveEvent};
 use shell::{Shell, ShellConfig, default_program};
 use sicompass_sdk::plugin::{
@@ -826,6 +826,44 @@ impl TerminalProvider {
         true
     }
 
+    /// A click, a drag or a wheel notch, for the program in the dashboard. It
+    /// goes as the program asked for it (`?1000`, `?1002`, `?1003`, `?1006`).
+    /// A program that asked for no mouse gets the wheel as three arrow keys on
+    /// the alternate screen (scrolling `less` and `man`, as other terminals do),
+    /// and nothing on the main one, which has no scrollback to move through.
+    fn dashboard_mouse(&mut self, ev: sicompass_sdk::DashboardMouse) -> bool {
+        use sicompass_sdk::DashboardMouseKind as K;
+        let Some(em) = self.emulator.as_ref() else {
+            return false;
+        };
+        let mode = em.mouse_mode();
+        let bytes = if mode.tracking != MouseTracking::Off {
+            encode_dashboard_mouse(&ev, mode)
+        } else if em.on_alternate_screen() && matches!(ev.kind, K::WheelUp | K::WheelDown) {
+            let arrow = if ev.kind == K::WheelUp {
+                sicompass_sdk::DashboardKeysym::Up
+            } else {
+                sicompass_sdk::DashboardKeysym::Down
+            };
+            encode_dashboard_key(&DashboardKey {
+                keysym: arrow,
+                ctrl: false,
+                shift: false,
+                alt: false,
+            })
+            .map(|b| b.repeat(3))
+        } else {
+            None
+        };
+        match (bytes, self.shell.as_mut()) {
+            (Some(bytes), Some(shell)) => {
+                let _ = shell.write_input(&bytes);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn dashboard_render(&mut self, cols: u16, rows: u16) -> DashboardFrame {
         // Pull any bytes the shell has produced since the last `tick()`.
         // Normally the main loop's `tick()` runs first, but draining here
@@ -1180,6 +1218,10 @@ impl Plugin for TerminalProvider {
 
     fn dashboard_key(&mut self, key: Key) -> bool {
         TerminalProvider::dashboard_key(self, key.into())
+    }
+
+    fn dashboard_mouse(&mut self, mouse: sicompass_sdk::plugin::Mouse) -> bool {
+        TerminalProvider::dashboard_mouse(self, mouse.into())
     }
 
     fn dashboard_text(&mut self, text: &str) {

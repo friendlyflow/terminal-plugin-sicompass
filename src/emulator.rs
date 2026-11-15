@@ -12,14 +12,17 @@
 //!   24-bit truecolor extensions.
 //! * DEC private modes: `?1049` (alternate screen), `?25` (cursor visibility),
 //!   `?7` (autowrap), `?2004` (bracketed paste — tracked so the provider can
-//!   wrap pasted text correctly).
+//!   wrap pasted text correctly), and the mouse: `?9`, `?1000`, `?1002` and
+//!   `?1003` (which events a program wants) and `?1006` (SGR encoding), turned
+//!   into bytes by [`encode_dashboard_mouse`].
 //!
-//! Out of scope (Phase 2b): mouse reporting, wide-char widths, GR character
-//! sets, sixel/SGR mouse, OSC titles, scrollback. The emulator's grid is
+//! Out of scope (Phase 2b): wide-char widths, GR character sets, sixel, OSC
+//! titles, scrollback. The emulator's grid is
 //! always exactly `cols × rows`; nothing scrolls off into a backbuffer.
 
 use sicompass_sdk::{
     CellAttrs, DashboardCell, DashboardCursor, DashboardFrame, DashboardKey, DashboardKeysym,
+    DashboardMouse, DashboardMouseButton, DashboardMouseKind,
 };
 use vte::{Params, Parser, Perform};
 
@@ -66,6 +69,16 @@ impl Emulator {
     /// The provider consults this to decide whether to bracket pasted text.
     pub fn bracketed_paste(&self) -> bool {
         self.state.bracketed_paste
+    }
+
+    /// Which mouse events the child program asked for, and how to send them.
+    pub fn mouse_mode(&self) -> MouseMode {
+        self.state.mouse
+    }
+
+    /// Whether the alternate screen (a full-screen program's) is showing.
+    pub fn on_alternate_screen(&self) -> bool {
+        self.state.on_alt
     }
 
     /// The primary-screen grid as text rows — trailing spaces and trailing
@@ -133,6 +146,8 @@ struct EmulatorState {
     /// Not used by the grid itself — read by the provider so it knows whether
     /// to wrap pasted text in `ESC[200~`/`ESC[201~`.
     bracketed_paste: bool,
+    /// The mouse reporting the child program turned on.
+    mouse: MouseMode,
     scroll_top: u16, // inclusive, 0-indexed
     scroll_bot: u16, // inclusive, 0-indexed
 }
@@ -152,6 +167,7 @@ impl EmulatorState {
             autowrap: true,
             pending_wrap: false,
             bracketed_paste: false,
+            mouse: MouseMode::default(),
             scroll_top: 0,
             scroll_bot: rows.saturating_sub(1),
         }
@@ -607,6 +623,11 @@ impl Perform for EmulatorState {
                             25 => self.cursor_visible = on,
                             1049 | 47 | 1047 => self.switch_screen(on),
                             2004 => self.bracketed_paste = on,
+                            9 => self.mouse.set_tracking(MouseTracking::X10, on),
+                            1000 => self.mouse.set_tracking(MouseTracking::Normal, on),
+                            1002 => self.mouse.set_tracking(MouseTracking::ButtonMotion, on),
+                            1003 => self.mouse.set_tracking(MouseTracking::AnyMotion, on),
+                            1006 => self.mouse.sgr = on,
                             _ => {}
                         }
                     }
@@ -782,6 +803,94 @@ fn palette_256(idx: u8) -> u32 {
 /// transmit for that keypress. Returns `None` for keysyms that produce no
 /// output (e.g. `Unknown`, or unmodified printable chars that arrive
 /// separately via `dashboard_text`).
+/// Which mouse events a program asked for, from the least to the most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
+pub enum MouseTracking {
+    #[default]
+    Off,
+    /// `?9`: presses only.
+    X10,
+    /// `?1000`: presses, releases and the wheel.
+    Normal,
+    /// `?1002`: also motion while a button is held.
+    ButtonMotion,
+    /// `?1003`: also motion with no button held.
+    AnyMotion,
+}
+
+/// The mouse reporting a program turned on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MouseMode {
+    pub tracking: MouseTracking,
+    /// `?1006`: SGR encoding (`ESC [ < b ; x ; y M`), which has no 223-cell limit
+    /// and says which button was released.
+    pub sgr: bool,
+}
+
+impl MouseMode {
+    /// `?Nh` turns a mode on. `?Nl` turns it off only if it is the one on, as
+    /// xterm does, so turning off a mode never set leaves the other alone.
+    fn set_tracking(&mut self, mode: MouseTracking, on: bool) {
+        if on {
+            self.tracking = mode;
+        } else if self.tracking == mode {
+            self.tracking = MouseTracking::Off;
+        }
+    }
+}
+
+/// The bytes that tell a program about a mouse event, as xterm sends them, or
+/// `None` when the program did not ask for this event (or a cell is too far out
+/// for the old encoding to name).
+pub fn encode_dashboard_mouse(ev: &DashboardMouse, mode: MouseMode) -> Option<Vec<u8>> {
+    use DashboardMouseKind as K;
+    let wanted = match (ev.kind, mode.tracking) {
+        (_, MouseTracking::Off) => false,
+        (K::Press, _) => true,
+        (_, MouseTracking::X10) => false,
+        (K::Release | K::WheelUp | K::WheelDown, _) => true,
+        (K::Motion, MouseTracking::ButtonMotion) => ev.button.is_some(),
+        (K::Motion, MouseTracking::AnyMotion) => true,
+        (K::Motion, MouseTracking::Normal) => false,
+    };
+    if !wanted {
+        return None;
+    }
+    let button = |b: Option<DashboardMouseButton>| match b {
+        Some(DashboardMouseButton::Left) => 0u32,
+        Some(DashboardMouseButton::Middle) => 1,
+        None => 3,
+    };
+    let mut code = match ev.kind {
+        K::Press => button(ev.button),
+        // The old encoding cannot say which button went up.
+        K::Release if mode.sgr => button(ev.button),
+        K::Release => 3,
+        K::Motion => 32 + button(ev.button),
+        K::WheelUp => 64,
+        K::WheelDown => 65,
+    };
+    // Modifiers, except in X10 mode, which has none.
+    if mode.tracking != MouseTracking::X10 {
+        code += 4 * u32::from(ev.shift) + 8 * u32::from(ev.alt) + 16 * u32::from(ev.ctrl);
+    }
+    let (x, y) = (u32::from(ev.col) + 1, u32::from(ev.row) + 1);
+    if mode.sgr {
+        let end = if ev.kind == K::Release { 'm' } else { 'M' };
+        return Some(format!("\x1b[<{code};{x};{y}{end}").into_bytes());
+    }
+    // One byte each, offset by 32: nothing past cell 223 can be named.
+    let byte = |n: u32| u8::try_from(n + 32).ok();
+    Some(vec![
+        0x1b,
+        b'[',
+        b'M',
+        byte(code)?,
+        byte(x)?,
+        byte(y)?,
+    ])
+}
+
 pub fn encode_dashboard_key(key: &DashboardKey) -> Option<Vec<u8>> {
     // xterm's modifier parameter: 1, plus 1 for Shift, 2 for Alt, 4 for Ctrl.
     // A modified arrow, Home or End is `ESC [ 1 ; m X` (Ctrl+Left is
@@ -896,6 +1005,105 @@ mod tests {
     fn cell_ch(em: &Emulator, col: u16, row: u16) -> char {
         let s = em.snapshot();
         s.cell(col, row).ch
+    }
+
+    fn mouse(kind: DashboardMouseKind, button: Option<DashboardMouseButton>) -> DashboardMouse {
+        DashboardMouse {
+            kind,
+            button,
+            col: 9,
+            row: 4,
+            ctrl: false,
+            shift: false,
+            alt: false,
+        }
+    }
+
+    #[test]
+    fn mouse_modes_track_the_dec_private_modes() {
+        let mut em = Emulator::new(80, 24);
+        assert_eq!(em.mouse_mode(), MouseMode::default());
+        em.feed(b"\x1b[?1002h\x1b[?1006h");
+        assert_eq!(
+            em.mouse_mode(),
+            MouseMode {
+                tracking: MouseTracking::ButtonMotion,
+                sgr: true
+            }
+        );
+        // Turning off a mode that is not the one on leaves it alone.
+        em.feed(b"\x1b[?1000l");
+        assert_eq!(em.mouse_mode().tracking, MouseTracking::ButtonMotion);
+        em.feed(b"\x1b[?1002l\x1b[?1006l");
+        assert_eq!(em.mouse_mode(), MouseMode::default());
+    }
+
+    #[test]
+    fn sgr_mouse_names_the_cell_and_the_released_button() {
+        use DashboardMouseButton as B;
+        use DashboardMouseKind as K;
+        let mode = MouseMode {
+            tracking: MouseTracking::Normal,
+            sgr: true,
+        };
+        let enc = |ev| encode_dashboard_mouse(&ev, mode).map(|b| String::from_utf8(b).unwrap());
+        assert_eq!(enc(mouse(K::Press, Some(B::Left))).as_deref(), Some("\x1b[<0;10;5M"));
+        assert_eq!(enc(mouse(K::Release, Some(B::Middle))).as_deref(), Some("\x1b[<1;10;5m"));
+        assert_eq!(enc(mouse(K::WheelDown, None)).as_deref(), Some("\x1b[<65;10;5M"));
+        let mut ctrl_shift = mouse(K::Press, Some(B::Left));
+        ctrl_shift.ctrl = true;
+        ctrl_shift.shift = true;
+        assert_eq!(enc(ctrl_shift).as_deref(), Some("\x1b[<20;10;5M"));
+        // Normal tracking asks for no motion.
+        assert_eq!(enc(mouse(K::Motion, Some(B::Left))), None);
+    }
+
+    #[test]
+    fn motion_is_sent_only_to_the_modes_that_ask_for_it() {
+        use DashboardMouseButton as B;
+        use DashboardMouseKind as K;
+        let mode = |tracking| MouseMode { tracking, sgr: true };
+        let drag = mouse(K::Motion, Some(B::Left));
+        let hover = mouse(K::Motion, None);
+        let enc = |ev, t| encode_dashboard_mouse(&ev, mode(t)).map(|b| String::from_utf8(b).unwrap());
+        assert_eq!(enc(drag, MouseTracking::ButtonMotion).as_deref(), Some("\x1b[<32;10;5M"));
+        assert_eq!(enc(hover, MouseTracking::ButtonMotion), None);
+        assert_eq!(enc(hover, MouseTracking::AnyMotion).as_deref(), Some("\x1b[<35;10;5M"));
+        assert_eq!(enc(drag, MouseTracking::Off), None);
+    }
+
+    #[test]
+    fn the_old_encoding_offsets_by_32_and_stops_at_cell_223() {
+        use DashboardMouseButton as B;
+        use DashboardMouseKind as K;
+        let normal = MouseMode {
+            tracking: MouseTracking::Normal,
+            sgr: false,
+        };
+        assert_eq!(
+            encode_dashboard_mouse(&mouse(K::Press, Some(B::Left)), normal),
+            Some(vec![0x1b, b'[', b'M', 32, 32 + 10, 32 + 5])
+        );
+        // A release says no button.
+        assert_eq!(
+            encode_dashboard_mouse(&mouse(K::Release, Some(B::Left)), normal),
+            Some(vec![0x1b, b'[', b'M', 32 + 3, 32 + 10, 32 + 5])
+        );
+        let mut far = mouse(K::Press, Some(B::Left));
+        far.col = 230;
+        assert_eq!(encode_dashboard_mouse(&far, normal), None);
+        // X10 sends presses only, and no modifiers.
+        let x10 = MouseMode {
+            tracking: MouseTracking::X10,
+            sgr: false,
+        };
+        let mut shifted = mouse(K::Press, Some(B::Middle));
+        shifted.shift = true;
+        assert_eq!(
+            encode_dashboard_mouse(&shifted, x10),
+            Some(vec![0x1b, b'[', b'M', 32 + 1, 32 + 10, 32 + 5])
+        );
+        assert_eq!(encode_dashboard_mouse(&mouse(K::Release, Some(B::Middle)), x10), None);
     }
 
     #[test]
